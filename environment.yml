@@ -1,0 +1,12 @@
+name: cs229-shortcut-detection
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - pytest
+  - pip

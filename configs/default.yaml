@@ -1,0 +1,21 @@
+seed: 229
+
+data:
+  dataset: chexpert
+  root_dir: data/chexpert
+  metadata_csv: data/chexpert/train.csv
+  label_columns:
+    - Cardiomegaly
+    - Pneumonia
+    - Pleural Effusion
+  hospital_column: null
+
+model:
+  name: densenet121
+
+training:
+  batch_size: 32
+  epochs: 10
+  learning_rate: 0.001
+
+output_dir: outputs/default
