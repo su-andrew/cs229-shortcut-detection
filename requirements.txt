@@ -1,6 +1,13 @@
 numpy
 pandas
 scikit-learn
+scikit-image
 matplotlib
 pyyaml
 pytest
+torch
+torchvision
+torchxrayvision
+grad-cam
+pydicom
+redivis
