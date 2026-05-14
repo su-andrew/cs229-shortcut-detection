@@ -4,9 +4,14 @@ data:
   dataset: chexpert
   root_dir: data/chexpert
   metadata_csv: data/chexpert/train.csv
+  # The 5 standard CheXpert competition labels — the set every CheXpert
+  # benchmark reports AUROC on. Pneumonia is one of the 14 CheXpert
+  # observations but is NOT one of the competition 5, so it's excluded here.
   label_columns:
+    - Atelectasis
     - Cardiomegaly
-    - Pneumonia
+    - Consolidation
+    - Edema
     - Pleural Effusion
   hospital_column: null
 
