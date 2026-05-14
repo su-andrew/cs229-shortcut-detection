@@ -10,10 +10,10 @@ dependencies:
   - matplotlib
   - pyyaml
   - pytest
+  - pytorch
+  - torchvision
   - pip
   - pip:
-      - torch
-      - torchvision
       - torchxrayvision
       - grad-cam
       - pydicom
