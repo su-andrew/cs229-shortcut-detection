@@ -1,0 +1,10 @@
+# Minimal project config. We're not packaging this for distribution yet; this file
+# exists so pytest can find the `src/` package during test collection (without it,
+# pytest doesn't add the repo root to sys.path and `from src.* import ...` fails).
+#
+# If we ever decide to make this an installable package (`pip install -e .`),
+# add a [build-system] and [project] table here.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
