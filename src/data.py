@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -311,3 +312,77 @@ def _image_max_value(image: np.ndarray) -> float:
     # arbitrary range; the bucketed heuristic crushed HU images to near-black.
     # Use the actual maximum.
     return float(np.nanmax(image))
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.data",
+        description="CheXpert data utilities.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Download the CheXpert validation split (images + labels) from Redivis.",
+        description=(
+            "Pull the CheXpert validation images and label table from Redivis "
+            "into a local directory. Requires REDIVIS_API_TOKEN to be set in "
+            "the environment. The dataset reference must be the 2-part "
+            "'owner.dataset' form (e.g. AIMI.chexpert_plus)."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--dataset-ref",
+        default=None,
+        help=(
+            "2-part 'owner.dataset' Redivis reference. Falls back to the "
+            "CHEXPERT_REDIVIS_DATASET env var."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--image-table",
+        default=None,
+        help=(
+            "Table name for the validation images. Falls back to "
+            "CHEXPERT_REDIVIS_IMAGE_TABLE, then 'PNG_valid'."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--metadata-table",
+        default=None,
+        help=(
+            "Table name for the labels/metadata. Falls back to "
+            "CHEXPERT_REDIVIS_METADATA_TABLE, then 'metadata'."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--output-dir",
+        default=str(CHEXPERT_DATA_DIR),
+        help=f"Local output directory (default: {CHEXPERT_DATA_DIR}).",
+    )
+    fetch_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing local files instead of skipping them.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
+
+    if args.command == "fetch":
+        paths = fetch_chexpert_valid(
+            output_dir=args.output_dir,
+            dataset_ref=args.dataset_ref,
+            image_table=args.image_table,
+            metadata_table=args.metadata_table,
+            overwrite=args.overwrite,
+        )
+        print("Fetched CheXpert validation data:")
+        print(f"  images:   {paths.image_dir}")
+        print(f"  metadata: {paths.metadata_csv}")
+
+
+if __name__ == "__main__":
+    main()
