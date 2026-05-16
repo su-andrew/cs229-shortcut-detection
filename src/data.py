@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -26,6 +27,19 @@ CHEXPERT_COMPETITION_LABELS = [
     "Pleural Effusion",
 ]
 
+CHEXPERT_MASTER_TABLE = "df_chexpert_plus_240401"
+CHEXPERT_LABELS_TABLE = "CheXpert Labels"
+CHEXPERT_LABEL_FILE = "report_fixed.json"
+CHEXPERT_DEMOGRAPHIC_COLUMNS = [
+    "age",
+    "sex",
+    "race",
+    "ethnicity",
+    "insurance_type",
+    "frontal_lateral",
+    "ap_pa",
+]
+
 
 @dataclass(frozen=True)
 class CheXpertValidPaths:
@@ -46,36 +60,86 @@ def load_metadata(csv_path: str | Path) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
+def _download_valid_images(
+    redivis: Any,
+    dataset_ref: str,
+    image_table: str,
+    image_dir: Path,
+    *,
+    overwrite: bool,
+    progress: bool,
+) -> pd.DataFrame:
+    table = _redivis_table(redivis, dataset_ref, image_table)
+    table.to_directory().download(
+        str(image_dir), overwrite=overwrite, progress=progress
+    )
+    relpaths = [
+        str(p.relative_to(image_dir))
+        for p in image_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    ]
+    return pd.DataFrame({"file_name": relpaths})
+
+
+def _load_master_demographics(
+    redivis: Any, dataset_ref: str, master_table: str
+) -> pd.DataFrame:
+    table = _redivis_table(redivis, dataset_ref, master_table)
+    columns = ["path_to_image", "split", *CHEXPERT_DEMOGRAPHIC_COLUMNS]
+    frame = table.to_pandas_dataframe(variables=columns, progress=False)
+    return _filter_valid_master(frame)
+
+
+def _load_chexbert_labels(
+    redivis: Any,
+    dataset_ref: str,
+    labels_table: str,
+    label_file: str,
+) -> pd.DataFrame:
+    table = _redivis_table(redivis, dataset_ref, labels_table)
+    files = list(table.list_files())
+    match = next((f for f in files if f.name == label_file), None)
+    if match is None:
+        available = ", ".join(sorted(f.name for f in files))
+        raise FileNotFoundError(
+            f"Label file {label_file!r} not found in table "
+            f"{labels_table!r}. Available: {available}"
+        )
+    text = match.read(as_text=True)
+    return _parse_chexbert_jsonl(text.splitlines())
+
+
 def fetch_chexpert_valid(
     output_dir: str | Path = CHEXPERT_DATA_DIR,
     *,
     dataset_ref: str | None = None,
-    image_table: str | None = None,
-    metadata_table: str | None = None,
+    image_table: str = CHEXPERT_IMAGE_DIRNAME,
+    master_table: str = CHEXPERT_MASTER_TABLE,
+    labels_table: str = CHEXPERT_LABELS_TABLE,
+    label_file: str = CHEXPERT_LABEL_FILE,
     image_dirname: str = CHEXPERT_IMAGE_DIRNAME,
     metadata_filename: str = CHEXPERT_METADATA_FILENAME,
-    file_id_variable: str | None = None,
-    file_name_variable: str | None = None,
     overwrite: bool = False,
     progress: bool = True,
 ) -> CheXpertValidPaths:
-    """Download CheXpert validation images and metadata from Redivis."""
+    """Download the CheXpert Plus validation split from Redivis and write a
+    merged ``metadata.csv``.
+
+    CheXpert Plus stores images, demographics, and CheXbert-derived labels
+    in three separate Redivis sources; this joins them on a canonical
+    ``patient/study/view`` path stem. Labels are CheXbert machine
+    extractions from report text (``report_fixed.json``), NOT radiologist
+    gold — expect ``-1`` (uncertain) and ``NaN`` (not mentioned) values.
+    """
     import redivis
 
     dataset_ref = dataset_ref or os.getenv("CHEXPERT_REDIVIS_DATASET")
     if dataset_ref is None or len(dataset_ref.split(".")) != 2:
         raise ValueError(
-            "A 2-part 'owner.dataset_name' Redivis reference is required: set "
-            "the CHEXPERT_REDIVIS_DATASET env var or pass dataset_ref=. Got "
-            f"{dataset_ref!r} — use the full owner-qualified name (redivis.table "
-            "builds 'owner.dataset.table'), not just the dataset name."
+            "A 2-part 'owner.dataset' Redivis reference is required: set "
+            "the CHEXPERT_REDIVIS_DATASET env var or pass dataset_ref= "
+            f"(e.g. 'AIMI.chexpert_plus'). Got {dataset_ref!r}."
         )
-    image_table = image_table or os.getenv(
-        "CHEXPERT_REDIVIS_IMAGE_TABLE", CHEXPERT_IMAGE_DIRNAME
-    )
-    metadata_table = metadata_table or os.getenv(
-        "CHEXPERT_REDIVIS_METADATA_TABLE", "metadata"
-    )
 
     output_path = Path(output_dir)
     image_dir = output_path / image_dirname
@@ -83,42 +147,37 @@ def fetch_chexpert_valid(
     output_path.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    image_table_ref = _redivis_table(redivis, dataset_ref, image_table)
-    metadata_table_ref = _redivis_table(redivis, dataset_ref, metadata_table)
+    images_df = _download_valid_images(
+        redivis, dataset_ref, image_table, image_dir,
+        overwrite=overwrite, progress=progress,
+    )
+    master_df = _load_master_demographics(
+        redivis, dataset_ref, master_table
+    )
+    labels_df = _load_chexbert_labels(
+        redivis, dataset_ref, labels_table, label_file
+    )
 
-    directory_kwargs = _drop_none(
-        {
-            "file_id_variable": file_id_variable,
-            "file_name_variable": file_name_variable,
-        }
-    )
-    image_table_ref.to_directory(**directory_kwargs).download(
-        str(image_dir),
-        overwrite=overwrite,
-        progress=progress,
-    )
-    metadata_table_ref.download(
-        str(metadata_csv),
-        format="csv",
-        overwrite=overwrite,
-        progress=progress,
-    )
+    merged = merge_chexpert_sources(images_df, master_df, labels_df)
+    matched = int(merged[list(CHEXPERT_COMPETITION_LABELS)].notna().any(axis=1).sum())
+    print(f"{matched}/{len(merged)} images matched CheXbert labels")
+    merged.to_csv(metadata_csv, index=False)
 
     return CheXpertValidPaths(
-        root=output_path,
-        image_dir=image_dir,
-        metadata_csv=metadata_csv,
+        root=output_path, image_dir=image_dir, metadata_csv=metadata_csv
     )
 
 
 class CheXpertValidDataset:
-    """Map-style dataset over the fetched CheXpert validation split.
+    """Map-style dataset over the fetched CheXpert Plus validation split.
 
     ``label_columns`` defaults to the five CheXpert competition labels so
-    ``sample["labels"]`` is always populated. Note: CheXpert encodes
-    "not mentioned" as NaN and "uncertain" as -1; the radiologist-labeled
-    validation set is 0/1 only, but callers computing AUROC must still
-    filter non-{0,1} entries per label (``baseline.py`` does this).
+    ``sample["labels"]`` is always populated. Labels are CheXbert machine
+    extractions from report text (CheXpert Plus does not ship the original
+    radiologist-adjudicated valid labels): values include 1/0, -1
+    (uncertain), and NaN (not mentioned), in the validation split too.
+    Callers computing AUROC must filter non-{0,1} entries per label
+    (``baseline.py`` does this).
     """
 
     DEFAULT_IMAGE_COLUMNS = (
@@ -233,8 +292,94 @@ def _redivis_table(redivis: Any, dataset_ref: str | None, table_ref: str) -> Any
     return redivis.table(f"{dataset_ref}.{table_ref}")
 
 
-def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in values.items() if value is not None}
+def _chexpert_path_stem(path: str) -> str:
+    """Canonical join key: drop a leading 'valid/' split prefix and the
+    file extension so PNG image names, the master table, and the CheXbert
+    label JSONL all collapse to 'patient<ID>/study<N>/view<N>_<view>'."""
+    text = str(path)
+    if text.startswith("valid/"):
+        text = text[len("valid/"):]
+    root, _, ext = text.rpartition(".")
+    return root if root else text
+
+
+def _parse_chexbert_jsonl(lines: Iterable[str]) -> pd.DataFrame:
+    """Parse CheXbert JSON-Lines into a DataFrame, keeping only valid-split
+    rows and the 'path_to_image' + 5 competition-label columns. Iterates
+    the given lines once; values stay raw (1.0 / 0.0 / -1.0 / NaN)."""
+    keep = ["path_to_image", *CHEXPERT_COMPETITION_LABELS]
+    records = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        obj = json.loads(stripped)
+        if not str(obj.get("path_to_image", "")).startswith("valid/"):
+            continue
+        records.append({col: obj.get(col) for col in keep})
+
+    frame = pd.DataFrame(records, columns=keep)
+    for col in CHEXPERT_COMPETITION_LABELS:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame
+
+
+def _filter_valid_master(master: pd.DataFrame) -> pd.DataFrame:
+    """Keep valid-split rows and the path + demographic columns from the
+    CheXpert Plus master metadata table."""
+    columns = ["path_to_image", "split", *CHEXPERT_DEMOGRAPHIC_COLUMNS]
+    return master.loc[master["split"] == "valid", columns].reset_index(drop=True)
+
+
+def merge_chexpert_sources(
+    images: pd.DataFrame,
+    master: pd.DataFrame,
+    labels: pd.DataFrame,
+) -> pd.DataFrame:
+    """Join the three CheXpert Plus sources on a canonical path stem.
+
+    Images on disk are authoritative: one output row per image file.
+    Missing master/label data is left as NaN. Raises if no image matches
+    any label (signals a path-normalization regression).
+    """
+    img = images.copy()
+    img["_stem"] = img["file_name"].map(_chexpert_path_stem)
+    img["path"] = img["file_name"].astype(str)
+
+    mas = master.copy()
+    mas["_stem"] = mas["path_to_image"].map(_chexpert_path_stem)
+    mas = mas.drop(columns=["path_to_image"])
+
+    lab = labels.copy()
+    lab["_stem"] = lab["path_to_image"].map(_chexpert_path_stem)
+    lab = lab.drop(columns=["path_to_image"])
+    lab = lab.drop_duplicates(subset=["_stem"], keep="first")
+
+    if len(img) == 0:
+        raise ValueError(
+            "images DataFrame is empty — no image files were found "
+            "(check the image download)."
+        )
+
+    matched = img["_stem"].isin(set(lab["_stem"]))
+    if not matched.any():
+        raise ValueError(
+            f"0 of {len(img)} images matched any label row — path "
+            "normalization is likely broken (check _chexpert_path_stem)."
+        )
+
+    merged = (
+        img.merge(lab, on="_stem", how="left")
+        .merge(mas, on="_stem", how="left")
+    )
+
+    ordered = [
+        "path",
+        "split",
+        *CHEXPERT_COMPETITION_LABELS,
+        *CHEXPERT_DEMOGRAPHIC_COLUMNS,
+    ]
+    return merged[ordered].reset_index(drop=True)
 
 
 def _default_xrv_transform() -> Callable[[Any], Any]:
@@ -323,11 +468,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     fetch_parser = subparsers.add_parser(
         "fetch",
-        help="Download the CheXpert validation split (images + labels) from Redivis.",
+        help="Download the CheXpert Plus validation split (images + labels) from Redivis.",
         description=(
-            "Pull the CheXpert validation images and label table from Redivis "
-            "into a local directory. Requires REDIVIS_API_TOKEN to be set in "
-            "the environment. The dataset reference must be the 2-part "
+            "Pull the CheXpert Plus validation images, demographics, and CheXbert "
+            "labels from Redivis into a local directory. Requires REDIVIS_API_TOKEN "
+            "to be set in the environment. The dataset reference must be the 2-part "
             "'owner.dataset' form (e.g. AIMI.chexpert_plus)."
         ),
     )
@@ -341,19 +486,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     fetch_parser.add_argument(
         "--image-table",
-        default=None,
+        default=CHEXPERT_IMAGE_DIRNAME,
+        help=f"Redivis table name for the validation images (default: {CHEXPERT_IMAGE_DIRNAME}).",
+    )
+    fetch_parser.add_argument(
+        "--master-table",
+        default=CHEXPERT_MASTER_TABLE,
         help=(
-            "Table name for the validation images. Falls back to "
-            "CHEXPERT_REDIVIS_IMAGE_TABLE, then 'PNG_valid'."
+            f"Redivis table name for the master demographics table "
+            f"(default: {CHEXPERT_MASTER_TABLE})."
         ),
     )
     fetch_parser.add_argument(
-        "--metadata-table",
-        default=None,
+        "--labels-table",
+        default=CHEXPERT_LABELS_TABLE,
         help=(
-            "Table name for the labels/metadata. Falls back to "
-            "CHEXPERT_REDIVIS_METADATA_TABLE, then 'metadata'."
+            f"Redivis table name for the CheXbert labels table "
+            f"(default: {CHEXPERT_LABELS_TABLE})."
         ),
+    )
+    fetch_parser.add_argument(
+        "--label-file",
+        default=CHEXPERT_LABEL_FILE,
+        help=f"Filename of the CheXbert JSONL file within the labels table (default: {CHEXPERT_LABEL_FILE}).",
     )
     fetch_parser.add_argument(
         "--output-dir",
@@ -376,10 +531,12 @@ def main(argv: list[str] | None = None) -> None:
             output_dir=args.output_dir,
             dataset_ref=args.dataset_ref,
             image_table=args.image_table,
-            metadata_table=args.metadata_table,
+            master_table=args.master_table,
+            labels_table=args.labels_table,
+            label_file=args.label_file,
             overwrite=args.overwrite,
         )
-        print("Fetched CheXpert validation data:")
+        print("Fetched CheXpert Plus validation data:")
         print(f"  images:   {paths.image_dir}")
         print(f"  metadata: {paths.metadata_csv}")
 
