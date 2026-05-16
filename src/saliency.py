@@ -20,6 +20,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from src.data import default_xrv_transform, load_xray_image
+
 
 CHEXPERT_COMPETITION_LABELS = (
     "Atelectasis",
@@ -30,6 +32,9 @@ CHEXPERT_COMPETITION_LABELS = (
 )
 
 PATH_COLUMN_CANDIDATES = ("path", "image_path", "Path")
+XRV_PATHOLOGY_ALIASES = {
+    "Pleural Effusion": "Effusion",
+}
 ATTENTION_LOCATION_OPTIONS = ("inside_lung", "outside_lung", "mixed", "unclear")
 SHORTCUT_CATEGORY_OPTIONS = (
     "metadata_overlay",
@@ -353,9 +358,23 @@ def format_review_summary(summary: dict[str, object]) -> str:
 def resolve_image_path(image_root: Path, prediction_path: str) -> Path:
     """Resolve a predictions CSV image path against the local image root."""
     path = Path(prediction_path)
-    if path.is_absolute():
+    if path.is_absolute() or path.exists():
         return path
+
     return image_root / path
+
+
+def model_target_label(label: str, pathologies: Iterable[str]) -> str:
+    """Map a CheXpert label to the corresponding TorchXRayVision output name."""
+    pathologies = list(pathologies)
+    if label in pathologies:
+        return label
+
+    alias = XRV_PATHOLOGY_ALIASES.get(label)
+    if alias in pathologies:
+        return alias
+
+    raise ValueError(f"Could not find target label {label!r} in model pathologies.")
 
 
 def load_chexpert_model(device: str = "cpu"):
@@ -376,26 +395,24 @@ def load_chexpert_model(device: str = "cpu"):
 
 
 def load_xray_tensor(image_path: Path, device: str = "cpu"):
-    """Load a chest X-ray image and apply TorchXRayVision preprocessing."""
+    """Load a chest X-ray tensor with the shared data-loader preprocessing."""
     try:
-        import skimage.io
         import torch
-        import torchxrayvision as xrv
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Image loading needs scikit-image, torch, and torchxrayvision installed."
+            "Image loading needs torch installed. Run the project environment setup."
         ) from exc
 
-    image = skimage.io.imread(image_path)
-    if image.ndim == 3:
-        image = image.mean(axis=2)
+    try:
+        image = load_xray_image(image_path)
+        image = default_xrv_transform()(image)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Image loading needs torchxrayvision, torchvision, scikit-image, "
+            "and pydicom installed. Run the project environment setup."
+        ) from exc
 
-    image = xrv.datasets.normalize(image, 255)
-    image = image[None, ...]
-    image = xrv.datasets.XRayCenterCrop()(image)
-    image = xrv.datasets.XRayResizer(224)(image)
-
-    tensor = torch.from_numpy(image).float().unsqueeze(0)
+    tensor = torch.as_tensor(image, dtype=torch.float32).unsqueeze(0)
     return tensor.to(torch.device(device))
 
 
@@ -418,12 +435,11 @@ def render_gradcam(
         ) from exc
 
     pathologies = model_pathologies or getattr(model, "pathologies", None)
-    if pathologies is None or target_label not in pathologies:
-        raise ValueError(
-            f"Could not find target label {target_label!r} in model pathologies."
-        )
+    if pathologies is None:
+        raise ValueError("Model does not expose a pathologies list.")
 
-    target_index = list(pathologies).index(target_label)
+    xrv_label = model_target_label(target_label, pathologies)
+    target_index = list(pathologies).index(xrv_label)
     target_layers = [model.features.norm5]
     targets = [ClassifierOutputTarget(target_index)]
 
