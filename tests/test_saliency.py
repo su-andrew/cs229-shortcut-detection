@@ -1,17 +1,22 @@
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
+import src.saliency as saliency
 from src.saliency import (
     compute_label_aurocs,
     error_cases_to_frame,
     format_review_summary,
     gradcam_filename,
     lowest_auroc_labels,
+    model_target_label,
     review_template_from_cases,
+    resolve_image_path,
     select_error_cases,
+    load_xray_tensor,
     summarize_review_annotations,
     validate_prediction_columns,
 )
@@ -80,6 +85,42 @@ def test_review_template_points_to_expected_gradcam_paths() -> None:
     assert review.loc[0, "rendered_by_default"]
     assert review.loc[0, "attention_location"] == ""
     assert review.loc[0, "shortcut_category"] == ""
+
+
+def test_resolve_image_path_preserves_existing_relative_path(tmp_path, monkeypatch) -> None:
+    image_path = tmp_path / "data" / "chexpert" / "PNG_valid" / "case.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"not a real image")
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_image_path(
+        Path("data/chexpert"), "data/chexpert/PNG_valid/case.png"
+    )
+
+    assert resolved == Path("data/chexpert/PNG_valid/case.png")
+
+
+def test_model_target_label_maps_pleural_effusion_to_xrv_effusion() -> None:
+    assert model_target_label(
+        "Pleural Effusion", ["Atelectasis", "Effusion"]
+    ) == "Effusion"
+
+
+def test_load_xray_tensor_uses_shared_data_loader(monkeypatch) -> None:
+    def fake_load_xray_image(path):
+        assert path == Path("case.dcm")
+        return np.ones((1, 2, 2), dtype=np.float32)
+
+    def fake_transform():
+        return lambda image: image * 2
+
+    monkeypatch.setattr(saliency, "load_xray_image", fake_load_xray_image)
+    monkeypatch.setattr(saliency, "default_xrv_transform", fake_transform)
+
+    tensor = load_xray_tensor(Path("case.dcm"))
+
+    assert tuple(tensor.shape) == (1, 1, 2, 2)
+    assert float(tensor.max()) == 2.0
 
 
 def test_summarize_review_annotations_counts_shortcut_findings() -> None:

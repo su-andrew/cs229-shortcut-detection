@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -248,6 +249,16 @@ def _default_xrv_transform() -> Callable[[Any], Any]:
     )
 
 
+def default_xrv_transform() -> Callable[[Any], Any]:
+    """Return the standard TorchXRayVision crop/resize preprocessing."""
+    return _default_xrv_transform()
+
+
+def load_xray_image(image_path: str | Path) -> Any:
+    """Load and normalize a raster or DICOM chest X-ray as ``[1, H, W]``."""
+    return _load_xray_image(Path(image_path))
+
+
 def _load_xray_image(image_path: Path) -> Any:
     import torchxrayvision as xrv
 
@@ -311,3 +322,81 @@ def _image_max_value(image: np.ndarray) -> float:
     # arbitrary range; the bucketed heuristic crushed HU images to near-black.
     # Use the actual maximum.
     return float(np.nanmax(image))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CheXpert data utilities.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fetch_parser = subparsers.add_parser(
+        "fetch", help="Download CheXpert validation images and metadata from Redivis."
+    )
+    fetch_parser.add_argument("--output-dir", type=Path, default=CHEXPERT_DATA_DIR)
+    fetch_parser.add_argument("--dataset-ref")
+    fetch_parser.add_argument("--image-table")
+    fetch_parser.add_argument("--metadata-table")
+    fetch_parser.add_argument("--image-dirname", default=CHEXPERT_IMAGE_DIRNAME)
+    fetch_parser.add_argument("--metadata-filename", default=CHEXPERT_METADATA_FILENAME)
+    fetch_parser.add_argument("--file-id-variable")
+    fetch_parser.add_argument("--file-name-variable")
+    fetch_parser.add_argument("--overwrite", action="store_true")
+    fetch_parser.add_argument("--no-progress", action="store_true")
+
+    inspect_parser = subparsers.add_parser(
+        "inspect", help="Validate that a fetched CheXpert validation set is loadable."
+    )
+    inspect_parser.add_argument(
+        "--metadata-csv",
+        type=Path,
+        default=CHEXPERT_DATA_DIR / CHEXPERT_METADATA_FILENAME,
+    )
+    inspect_parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=CHEXPERT_DATA_DIR / CHEXPERT_IMAGE_DIRNAME,
+    )
+    inspect_parser.add_argument("--image-column")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "fetch":
+        paths = fetch_chexpert_valid(
+            output_dir=args.output_dir,
+            dataset_ref=args.dataset_ref,
+            image_table=args.image_table,
+            metadata_table=args.metadata_table,
+            image_dirname=args.image_dirname,
+            metadata_filename=args.metadata_filename,
+            file_id_variable=args.file_id_variable,
+            file_name_variable=args.file_name_variable,
+            overwrite=args.overwrite,
+            progress=not args.no_progress,
+        )
+        print(f"Wrote metadata to {paths.metadata_csv}")
+        print(f"Wrote images under {paths.image_dir}")
+        return
+
+    if args.command == "inspect":
+        dataset = CheXpertValidDataset(
+            metadata_csv=args.metadata_csv,
+            image_root=args.image_root,
+            image_column=args.image_column,
+            transform=None,
+        )
+        print(f"Loaded {len(dataset)} metadata row(s)")
+        if len(dataset):
+            sample = dataset[0]
+            print(f"First image: {sample['image_path']}")
+            print(f"Image tensor shape: {tuple(sample['image'].shape)}")
+            print(f"Label shape: {tuple(sample['labels'].shape)}")
+        return
+
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
