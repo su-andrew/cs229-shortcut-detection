@@ -1,29 +1,5 @@
-'''
-Expected prediction columns:
-
-```text
-path
-Atelectasis_true, Atelectasis_pred
-Cardiomegaly_true, Cardiomegaly_pred
-Consolidation_true, Consolidation_pred
-Edema_true, Edema_pred
-Pleural Effusion_true, Pleural Effusion_pred
-```
-
-Select the lowest-AUROC labels and high-confidence FP/FN cases without rendering:
-
-```bash
-python -m src.saliency --predictions-csv results/predictions_val.csv --select-only
-```
-
-Render the first Grad-CAM overlays once images are present:
-
-```bash
-python -m src.saliency --predictions-csv results/predictions_val.csv --image-root data/chexpert
-
-'''
-
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -31,8 +7,12 @@ import pytest
 from src.saliency import (
     compute_label_aurocs,
     error_cases_to_frame,
+    format_review_summary,
+    gradcam_filename,
     lowest_auroc_labels,
+    review_template_from_cases,
     select_error_cases,
+    summarize_review_annotations,
     validate_prediction_columns,
 )
 
@@ -77,3 +57,53 @@ def test_select_error_cases_picks_confident_fp_and_fn() -> None:
     assert selected["path"].tolist() == ["fp1.png", "fn1.png"]
     assert selected["error_type"].tolist() == ["false_positive", "false_negative"]
     assert selected["confidence"].tolist() == [0.95, 0.95]
+
+
+def test_review_template_points_to_expected_gradcam_paths() -> None:
+    predictions = pd.DataFrame(
+        {
+            "path": ["fp1.png"],
+            "Pleural Effusion_true": [0],
+            "Pleural Effusion_pred": [0.95],
+        }
+    )
+
+    case = select_error_cases(predictions, ["Pleural Effusion"], top_k_per_type=1)[0]
+    review = review_template_from_cases(
+        [case], Path("results/figures"), max_figures=1
+    )
+
+    assert gradcam_filename(case) == "pleural_effusion_false_positive_1.png"
+    assert review.loc[0, "gradcam_path"] == (
+        "results/figures/pleural_effusion_false_positive_1.png"
+    )
+    assert review.loc[0, "rendered_by_default"]
+    assert review.loc[0, "attention_location"] == ""
+    assert review.loc[0, "shortcut_category"] == ""
+
+
+def test_summarize_review_annotations_counts_shortcut_findings() -> None:
+    review = pd.DataFrame(
+        {
+            "label": ["Edema", "Edema", "Cardiomegaly"],
+            "gradcam_path": ["a.png", "b.png", "c.png"],
+            "rendered_by_default": [True, True, False],
+            "attention_location": ["outside_lung", "mixed", "inside_lung"],
+            "shortcut_category": ["laterality_marker", "support_device", "none"],
+            "include_in_report": ["yes", "", "true"],
+            "notes": ["corner marker", "device cue", "looks plausible"],
+        }
+    )
+
+    summary = summarize_review_annotations(review)
+    summary_text = format_review_summary(summary)
+
+    assert summary["reviewed"] == 3
+    assert summary["outside_lung"] == 1
+    assert summary["outside_or_mixed"] == 2
+    assert summary["included_for_report"] == 2
+    assert summary["shortcut_category_counts"] == {
+        "laterality_marker": 1,
+        "support_device": 1,
+    }
+    assert "2 showed peak or mixed attention outside the lung field" in summary_text

@@ -30,6 +30,24 @@ CHEXPERT_COMPETITION_LABELS = (
 )
 
 PATH_COLUMN_CANDIDATES = ("path", "image_path", "Path")
+ATTENTION_LOCATION_OPTIONS = ("inside_lung", "outside_lung", "mixed", "unclear")
+SHORTCUT_CATEGORY_OPTIONS = (
+    "metadata_overlay",
+    "laterality_marker",
+    "support_device",
+    "acquisition_artifact",
+    "image_border",
+    "none",
+    "unclear",
+)
+REVIEW_COLUMNS = (
+    "gradcam_path",
+    "rendered_by_default",
+    "attention_location",
+    "shortcut_category",
+    "include_in_report",
+    "notes",
+)
 
 
 @dataclass(frozen=True)
@@ -216,6 +234,122 @@ def error_cases_to_frame(cases: Iterable[ErrorCase]) -> pd.DataFrame:
     return pd.DataFrame([case.__dict__ for case in cases])
 
 
+def slugify(value: str) -> str:
+    """Create a filesystem-safe identifier for labels and figure names."""
+    slug = "".join(char.lower() if char.isalnum() else "_" for char in value)
+    return "_".join(part for part in slug.split("_") if part)
+
+
+def gradcam_filename(case: ErrorCase) -> str:
+    """Return the deterministic filename used for a case's Grad-CAM PNG."""
+    safe_label = slugify(case.label)
+    return f"{safe_label}_{case.error_type}_{case.rank}.png"
+
+
+def review_template_from_cases(
+    cases: Iterable[ErrorCase], output_dir: Path, max_figures: int | None = None
+) -> pd.DataFrame:
+    """Create a manual review sheet for eyeballing rendered Grad-CAM figures."""
+    rows: list[dict[str, object]] = []
+    for index, case in enumerate(cases):
+        row = dict(case.__dict__)
+        row.update(
+            {
+                "gradcam_path": str(output_dir / gradcam_filename(case)),
+                "rendered_by_default": (
+                    max_figures is None or index < max_figures
+                ),
+                "attention_location": "",
+                "shortcut_category": "",
+                "include_in_report": "",
+                "notes": "",
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _normalise_review_value(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip().lower()
+
+
+def _truthy_review_value(value: object) -> bool:
+    return _normalise_review_value(value) in {"1", "true", "yes", "y"}
+
+
+def summarize_review_annotations(review: pd.DataFrame) -> dict[str, object]:
+    """Summarize a filled manual review CSV into milestone-ready counts."""
+    missing = [column for column in REVIEW_COLUMNS if column not in review.columns]
+    if missing:
+        raise ValueError(
+            "Review CSV is missing required columns: " + ", ".join(missing)
+        )
+
+    reviewed = review[
+        review["attention_location"].map(_normalise_review_value).isin(
+            ATTENTION_LOCATION_OPTIONS
+        )
+    ].copy()
+    attention_locations = reviewed["attention_location"].map(_normalise_review_value)
+    shortcut_categories = reviewed["shortcut_category"].map(_normalise_review_value)
+    valid_shortcut_categories = shortcut_categories[
+        shortcut_categories.isin(SHORTCUT_CATEGORY_OPTIONS)
+        & ~shortcut_categories.isin({"none", "unclear"})
+    ]
+
+    outside_lung = int((attention_locations == "outside_lung").sum())
+    outside_or_mixed = int(
+        attention_locations.isin({"outside_lung", "mixed"}).sum()
+    )
+
+    return {
+        "total_selected": int(len(review)),
+        "reviewed": int(len(reviewed)),
+        "outside_lung": outside_lung,
+        "outside_or_mixed": outside_or_mixed,
+        "included_for_report": int(
+            review["include_in_report"].map(_truthy_review_value).sum()
+        ),
+        "shortcut_category_counts": valid_shortcut_categories.value_counts().to_dict(),
+        "label_counts": reviewed["label"].value_counts().to_dict()
+        if "label" in reviewed.columns
+        else {},
+    }
+
+
+def format_review_summary(summary: dict[str, object]) -> str:
+    """Format review counts as a concise paragraph for the milestone draft."""
+    reviewed = int(summary["reviewed"])
+    total_selected = int(summary["total_selected"])
+    outside_or_mixed = int(summary["outside_or_mixed"])
+    included = int(summary["included_for_report"])
+    category_counts = summary["shortcut_category_counts"]
+
+    if not reviewed:
+        return (
+            f"No Grad-CAM cases have been manually reviewed yet "
+            f"({total_selected} selected)."
+        )
+
+    if isinstance(category_counts, dict) and category_counts:
+        category_text = ", ".join(
+            f"{category.replace('_', ' ')} ({count})"
+            for category, count in category_counts.items()
+        )
+    else:
+        category_text = "no specific shortcut category marked yet"
+
+    return (
+        f"Manual Grad-CAM review inspected {reviewed} of {total_selected} selected "
+        f"high-confidence errors. {outside_or_mixed} showed peak or mixed attention "
+        f"outside the lung field. Marked shortcut cues: {category_text}. "
+        f"{included} case(s) were flagged for the milestone figure."
+    )
+
+
 def resolve_image_path(image_root: Path, prediction_path: str) -> Path:
     """Resolve a predictions CSV image path against the local image root."""
     path = Path(prediction_path)
@@ -325,8 +459,7 @@ def render_error_case_figures(
                 f"Image for selected error case does not exist: {image_path}"
             )
 
-        safe_label = case.label.lower().replace(" ", "_")
-        output_path = output_dir / f"{safe_label}_{case.error_type}_{case.rank}.png"
+        output_path = output_dir / gradcam_filename(case)
         image_tensor = load_xray_tensor(image_path, device=device)
         render_gradcam(model, image_tensor, case.label, output_path)
         written.append(output_path)
@@ -339,7 +472,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predictions-csv",
         type=Path,
-        required=True,
         help="Step 3 predictions CSV with path, *_true, and *_pred columns.",
     )
     parser.add_argument(
@@ -394,11 +526,38 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only write selected_errors.csv; skip Grad-CAM rendering.",
     )
+    parser.add_argument(
+        "--review-csv",
+        type=Path,
+        help="Filled manual_review_template.csv to summarize after visual review.",
+    )
+    parser.add_argument(
+        "--summarize-review",
+        action="store_true",
+        help="Summarize a filled review CSV and skip selection/rendering.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.summarize_review:
+        if args.review_csv is None:
+            raise SystemExit("--review-csv is required with --summarize-review")
+        review = pd.read_csv(args.review_csv)
+        summary_text = format_review_summary(summarize_review_annotations(review))
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = args.output_dir / "review_summary.txt"
+        summary_path.write_text(summary_text + "\n", encoding="utf-8")
+        print(summary_text)
+        print(f"Wrote review summary to {summary_path}")
+        return
+
+    if args.predictions_csv is None:
+        raise SystemExit(
+            "--predictions-csv is required unless --summarize-review is used"
+        )
+
     predictions = pd.read_csv(args.predictions_csv)
     aurocs = compute_label_aurocs(predictions, args.labels)
     audit_labels = lowest_auroc_labels(aurocs, args.num_labels)
@@ -413,9 +572,14 @@ def main() -> None:
     aurocs.to_csv(args.output_dir / "computed_aurocs.csv", header=True)
     selected_path = args.output_dir / "selected_errors.csv"
     error_cases_to_frame(cases).to_csv(selected_path, index=False)
+    review_path = args.output_dir / "manual_review_template.csv"
+    review_template_from_cases(cases, args.output_dir, args.max_figures).to_csv(
+        review_path, index=False
+    )
 
     print(f"Auditing labels: {', '.join(audit_labels)}")
     print(f"Wrote selected errors to {selected_path}")
+    print(f"Wrote manual review template to {review_path}")
 
     if args.select_only:
         print("Skipped Grad-CAM rendering because --select-only was passed.")
