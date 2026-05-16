@@ -189,7 +189,25 @@ def test_merge_raises_when_no_image_matches_any_label():
         merge_chexpert_sources(images, master, labels)
 
 
-def test_merge_deduplicates_labels_with_same_stem():
+def test_merge_collapses_identical_duplicate_labels():
+    # Same stem, identical values: a harmless duplicate — collapse to 1 row.
+    images = _images_df("patient64620/study1/view1_frontal.png")
+    master = _master_df([])
+    labels = _labels_df(
+        [
+            ["valid/patient64620/study1/view1_frontal.jpg", 1, 0, 0, 0, 0],
+            ["valid/patient64620/study1/view1_frontal.jpg", 1, 0, 0, 0, 0],
+        ]
+    )
+
+    out = merge_chexpert_sources(images, master, labels)
+
+    assert len(out) == 1  # one row per image; identical dupes collapsed
+
+
+def test_merge_raises_on_conflicting_duplicate_labels():
+    # Same stem, DISAGREEING values: silently keeping the first would pair an
+    # image with arbitrary labels and corrupt AUROC — must raise (Codex #4).
     images = _images_df("patient64620/study1/view1_frontal.png")
     master = _master_df([])
     labels = _labels_df(
@@ -199,9 +217,28 @@ def test_merge_deduplicates_labels_with_same_stem():
         ]
     )
 
-    out = merge_chexpert_sources(images, master, labels)
+    with pytest.raises(ValueError, match="patient64620/study1/view1_frontal"):
+        merge_chexpert_sources(images, master, labels)
 
-    assert len(out) == 1  # one row per image despite duplicate label rows
+
+def test_merge_raises_on_conflicting_duplicate_master():
+    # Same stem, disagreeing demographics would silently inflate output rows
+    # per image — must raise (Codex #2).
+    images = _images_df("patient64620/study1/view1_frontal.png")
+    master = _master_df(
+        [
+            ["valid/patient64620/study1/view1_frontal.jpg", "valid",
+             55, "F", "Asian", "Hispanic", "Private", "Frontal", "PA"],
+            ["valid/patient64620/study1/view1_frontal.jpg", "valid",
+             61, "M", "White", "NonHispanic", "Medicare", "Frontal", "AP"],
+        ]
+    )
+    labels = _labels_df(
+        [["valid/patient64620/study1/view1_frontal.jpg", 1, 0, 0, 0, 0]]
+    )
+
+    with pytest.raises(ValueError, match="master demographics"):
+        merge_chexpert_sources(images, master, labels)
 
 
 def test_merge_raises_when_images_empty():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import io
 import json
 import os
 from pathlib import Path
@@ -111,8 +112,12 @@ def _load_chexbert_labels(
             f"Label file {label_file!r} not found in table "
             f"{labels_table!r}. Available: {available}"
         )
+    # Redivis' file API exposes no incremental reader, so `read(as_text=True)`
+    # is an unavoidable single in-memory read of the ~84MB label file. Iterate
+    # it via StringIO rather than `.splitlines()` so we don't also materialize
+    # a second full list of ~223k line strings.
     text = match.read(as_text=True)
-    return _parse_chexbert_jsonl(text.splitlines())
+    return _parse_chexbert_jsonl(io.StringIO(text))
 
 
 def fetch_chexpert_valid(
@@ -166,8 +171,31 @@ def fetch_chexpert_valid(
     )
 
     merged = merge_chexpert_sources(images_df, master_df, labels_df)
-    matched = int(merged[list(CHEXPERT_COMPETITION_LABELS)].notna().any(axis=1).sum())
-    print(f"{matched}/{len(merged)} images matched CheXbert labels")
+
+    # Accurate join count: an image "has a label row" iff its stem is present
+    # in the label source — independent of whether the 5 labels are all NaN
+    # ("not mentioned"). The old `notna().any()` conflated those.
+    img_stems = images_df["file_name"].map(_chexpert_path_stem)
+    label_stems = set(labels_df["path_to_image"].map(_chexpert_path_stem))
+    n_joined = int(img_stems.isin(label_stems).sum())
+    print(f"{n_joined}/{len(images_df)} images joined to a CheXbert label row")
+
+    # Per-label class balance, so an undefined label (e.g. Atelectasis has
+    # n_neg=0 under impression_fixed) is visible here, not silently at eval.
+    print("per-label class balance (1=pos, 0=neg; -1/NaN = uncertain/not mentioned):")
+    for label in CHEXPERT_COMPETITION_LABELS:
+        col = merged[label]
+        n_pos = int((col == 1.0).sum())
+        n_neg = int((col == 0.0).sum())
+        n_other = len(merged) - n_pos - n_neg
+        warn = "  [WARNING: <2 classes — AUROC undefined]" if (
+            n_pos == 0 or n_neg == 0
+        ) else ""
+        print(
+            f"  {label}: pos={n_pos} neg={n_neg} "
+            f"uncertain/unlabeled={n_other}{warn}"
+        )
+
     merged.to_csv(metadata_csv, index=False)
 
     return CheXpertValidPaths(
@@ -310,6 +338,31 @@ def _chexpert_path_stem(path: str) -> str:
     return root if root else text
 
 
+def _dedup_by_stem(frame: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Collapse rows sharing a ``_stem``. Identical duplicates are dropped;
+    duplicates whose other columns disagree raise — silently keeping the
+    first would corrupt the join (one image paired with arbitrary metadata
+    or, for master, an inflated number of output rows per image)."""
+    dups = frame[frame.duplicated(subset=["_stem"], keep=False)]
+    if not dups.empty:
+        conflicting = sorted(
+            stem
+            for stem, group in dups.groupby("_stem")
+            if len(group.drop_duplicates()) > 1
+        )
+        if conflicting:
+            shown = ", ".join(conflicting[:10])
+            more = (
+                "" if len(conflicting) <= 10
+                else f" (+{len(conflicting) - 10} more)"
+            )
+            raise ValueError(
+                f"{source_name} has conflicting rows for the same "
+                f"patient/study/view stem: {shown}{more}"
+            )
+    return frame.drop_duplicates(subset=["_stem"], keep="first")
+
+
 def _parse_chexbert_jsonl(lines: Iterable[str]) -> pd.DataFrame:
     """Parse CheXbert JSON-Lines into a DataFrame, keeping only valid-split
     rows and the 'path_to_image' + 5 competition-label columns. Iterates
@@ -356,11 +409,12 @@ def merge_chexpert_sources(
     mas = master.copy()
     mas["_stem"] = mas["path_to_image"].map(_chexpert_path_stem)
     mas = mas.drop(columns=["path_to_image"])
+    mas = _dedup_by_stem(mas, "master demographics")
 
     lab = labels.copy()
     lab["_stem"] = lab["path_to_image"].map(_chexpert_path_stem)
     lab = lab.drop(columns=["path_to_image"])
-    lab = lab.drop_duplicates(subset=["_stem"], keep="first")
+    lab = _dedup_by_stem(lab, "CheXbert labels")
 
     if len(img) == 0:
         raise ValueError(
