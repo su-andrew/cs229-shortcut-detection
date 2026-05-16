@@ -29,7 +29,13 @@ CHEXPERT_COMPETITION_LABELS = [
 
 CHEXPERT_MASTER_TABLE = "df_chexpert_plus_240401"
 CHEXPERT_LABELS_TABLE = "CheXpert Labels"
-CHEXPERT_LABEL_FILE = "report_fixed.json"
+# CheXbert label derivation. report_fixed.json's valid-split labels are
+# near-random (an upstream CheXpert Plus artifact defect): scoring a
+# pretrained xrv DenseNet against it gives chance AUROC, while the exact
+# same predictions score ~0.85-0.88 against impression_fixed.json and
+# ~0.81-0.94 against findings_fixed.json. Default to impression (best
+# AUROC + coverage; PE n=116). Override per task via --label-file.
+CHEXPERT_LABEL_FILE = "impression_fixed.json"
 CHEXPERT_DEMOGRAPHIC_COLUMNS = [
     "age",
     "sex",
@@ -128,8 +134,9 @@ def fetch_chexpert_valid(
     CheXpert Plus stores images, demographics, and CheXbert-derived labels
     in three separate Redivis sources; this joins them on a canonical
     ``patient/study/view`` path stem. Labels are CheXbert machine
-    extractions from report text (``report_fixed.json``), NOT radiologist
-    gold — expect ``-1`` (uncertain) and ``NaN`` (not mentioned) values.
+    extractions from report text (``impression_fixed.json`` by default),
+    NOT radiologist gold — expect ``-1`` (uncertain) and ``NaN`` (not
+    mentioned) values.
     """
     import redivis
 
