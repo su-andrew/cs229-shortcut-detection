@@ -10,11 +10,6 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 
-try:
-    from torch.utils.data import Dataset as TorchDataset
-except ImportError:  # pragma: no cover - keeps metadata utilities importable
-    TorchDataset = object
-
 
 CHEXPERT_DATA_DIR = Path("data/chexpert")
 CHEXPERT_IMAGE_DIRNAME = "PNG_valid"
@@ -23,14 +18,11 @@ CHEXPERT_METADATA_FILENAME = "metadata.csv"
 
 @dataclass(frozen=True)
 class CheXpertValidPaths:
-    """Local files produced by :func:`fetch_chexpert_valid`."""
-
     root: Path
     image_dir: Path
     metadata_csv: Path
 
     def dataset(self, **kwargs: Any) -> CheXpertValidDataset:
-        """Construct a one-line loadable validation dataset from fetched files."""
         return CheXpertValidDataset(
             metadata_csv=self.metadata_csv,
             image_root=self.image_dir,
@@ -56,21 +48,8 @@ def fetch_chexpert_valid(
     overwrite: bool = False,
     progress: bool = True,
 ) -> CheXpertValidPaths:
-    """Download the CheXpert validation images and metadata from Redivis.
-
-    The exact CheXpert Plus Redivis dataset reference is access-controlled, so
-    callers can provide it directly or via ``CHEXPERT_REDIVIS_DATASET``. Table
-    names default to ``PNG_valid`` for images and ``metadata`` for the CSV, and
-    can be overridden with ``CHEXPERT_REDIVIS_IMAGE_TABLE`` and
-    ``CHEXPERT_REDIVIS_METADATA_TABLE``.
-    """
-    try:
-        import redivis
-    except ImportError as exc:  # pragma: no cover - depends on local env setup
-        raise ImportError(
-            "Install the `redivis` package or update the project environment "
-            "before fetching CheXpert data."
-        ) from exc
+    """Download CheXpert validation images and metadata from Redivis."""
+    import redivis
 
     dataset_ref = dataset_ref or os.getenv("CHEXPERT_REDIVIS_DATASET")
     image_table = image_table or os.getenv(
@@ -113,13 +92,7 @@ def fetch_chexpert_valid(
     )
 
 
-class CheXpertValidDataset(TorchDataset):
-    """Torch-compatible Dataset for the fetched CheXpert validation split.
-
-    Images are loaded from PNG/JPG or DICOM files, converted to one channel, and
-    normalized with ``torchxrayvision.datasets.normalize``.
-    """
-
+class CheXpertValidDataset:
     DEFAULT_IMAGE_COLUMNS = (
         "path",
         "Path",
@@ -233,14 +206,8 @@ def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def _default_xrv_transform() -> Callable[[Any], Any]:
-    try:
-        import torchxrayvision as xrv
-        import torchvision
-    except ImportError as exc:  # pragma: no cover - depends on local env setup
-        raise ImportError(
-            "Install `torchxrayvision` and `torchvision` before constructing the "
-            "CheXpert dataset."
-        ) from exc
+    import torchxrayvision as xrv
+    import torchvision
 
     return torchvision.transforms.Compose(
         [
