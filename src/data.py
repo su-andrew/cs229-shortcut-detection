@@ -15,6 +15,16 @@ CHEXPERT_DATA_DIR = Path("data/chexpert")
 CHEXPERT_IMAGE_DIRNAME = "PNG_valid"
 CHEXPERT_METADATA_FILENAME = "metadata.csv"
 
+# The five CheXpert competition labels. Default label set for the dataset so
+# the `sample["labels"]` contract holds without the caller having to pass them.
+CHEXPERT_COMPETITION_LABELS = [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Pleural Effusion",
+]
+
 
 @dataclass(frozen=True)
 class CheXpertValidPaths:
@@ -52,6 +62,13 @@ def fetch_chexpert_valid(
     import redivis
 
     dataset_ref = dataset_ref or os.getenv("CHEXPERT_REDIVIS_DATASET")
+    if dataset_ref is None or len(dataset_ref.split(".")) != 2:
+        raise ValueError(
+            "A 2-part 'owner.dataset_name' Redivis reference is required: set "
+            "the CHEXPERT_REDIVIS_DATASET env var or pass dataset_ref=. Got "
+            f"{dataset_ref!r} — use the full owner-qualified name (redivis.table "
+            "builds 'owner.dataset.table'), not just the dataset name."
+        )
     image_table = image_table or os.getenv(
         "CHEXPERT_REDIVIS_IMAGE_TABLE", CHEXPERT_IMAGE_DIRNAME
     )
@@ -77,6 +94,7 @@ def fetch_chexpert_valid(
     image_table_ref.to_directory(**directory_kwargs).download(
         str(image_dir),
         overwrite=overwrite,
+        progress=progress,
     )
     metadata_table_ref.download(
         str(metadata_csv),
@@ -93,6 +111,15 @@ def fetch_chexpert_valid(
 
 
 class CheXpertValidDataset:
+    """Map-style dataset over the fetched CheXpert validation split.
+
+    ``label_columns`` defaults to the five CheXpert competition labels so
+    ``sample["labels"]`` is always populated. Note: CheXpert encodes
+    "not mentioned" as NaN and "uncertain" as -1; the radiologist-labeled
+    validation set is 0/1 only, but callers computing AUROC must still
+    filter non-{0,1} entries per label (``baseline.py`` does this).
+    """
+
     DEFAULT_IMAGE_COLUMNS = (
         "path",
         "Path",
@@ -119,7 +146,11 @@ class CheXpertValidDataset:
         self.image_root = Path(image_root)
         self.metadata = load_metadata(self.metadata_csv)
         self.image_column = image_column or self._infer_image_column(self.metadata)
-        self.label_columns = list(label_columns) if label_columns is not None else None
+        self.label_columns = (
+            list(label_columns)
+            if label_columns is not None
+            else list(CHEXPERT_COMPETITION_LABELS)
+        )
         self.transform = transform or _default_xrv_transform()
         self.include_metadata = include_metadata
         self._image_index = self._build_image_index(self.image_root)
@@ -137,7 +168,7 @@ class CheXpertValidDataset:
 
         sample: dict[str, Any] = {
             "image": _as_float_tensor(image),
-            "image_path": image_path,
+            "image_path": str(image_path),
         }
         if self.label_columns is not None:
             sample["labels"] = row[self.label_columns].astype("float32").to_numpy()
@@ -245,7 +276,15 @@ def _as_float_tensor(image: Any) -> Any:
 def _read_raster_image(image_path: Path) -> np.ndarray:
     from skimage.io import imread
 
-    return imread(image_path)
+    image = imread(image_path)
+    if image.ndim == 3:
+        # Drop an alpha channel before collapsing to grayscale — otherwise
+        # the (typically 255) alpha gets averaged into every pixel. dtype is
+        # preserved so the integer branch of _image_max_value still applies.
+        if image.shape[2] == 4:
+            image = image[..., :3]
+        image = image.mean(axis=2).astype(image.dtype)
+    return image
 
 
 def _read_dicom_image(image_path: Path) -> np.ndarray:
@@ -268,9 +307,7 @@ def _image_max_value(image: np.ndarray) -> float:
     if np.issubdtype(image.dtype, np.integer):
         return float(np.iinfo(image.dtype).max)
 
-    image_max = float(np.nanmax(image))
-    if image_max <= 1.0:
-        return 1.0
-    if image_max <= 255.0:
-        return 255.0
-    return 65535.0
+    # Float images (e.g. DICOM after rescale slope/intercept) can span an
+    # arbitrary range; the bucketed heuristic crushed HU images to near-black.
+    # Use the actual maximum.
+    return float(np.nanmax(image))
