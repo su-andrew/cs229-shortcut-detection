@@ -117,7 +117,10 @@ def compute_label_aurocs(
     for label in labels:
         y_true = predictions[true_column(label)].to_numpy()
         y_pred = predictions[pred_column(label)].to_numpy()
-        valid = np.isfinite(y_true) & np.isfinite(y_pred)
+        # CheXpert: NaN = "not mentioned", -1 = uncertain. Restrict to clean
+        # 0/1 before ranking so uncertain rows can't inflate AUROC > 1.0
+        # (mirrors the exclusion contract in baseline.py).
+        valid = np.isin(y_true, (0.0, 1.0)) & np.isfinite(y_pred)
         y_true = y_true[valid].astype(int)
         y_pred = y_pred[valid].astype(float)
 
@@ -191,6 +194,9 @@ def select_error_cases(
             columns={path_column: "path", label_true: "y_true", label_pred: "y_pred"}
         )
         frame = frame.dropna(subset=["y_true", "y_pred"])
+        # Exclude CheXpert uncertain (-1) rows explicitly, matching the
+        # baseline.py / compute_label_aurocs exclusion contract.
+        frame = frame[frame["y_true"].isin((0.0, 1.0))]
         frame["y_true"] = frame["y_true"].astype(int)
         frame["y_pred"] = frame["y_pred"].astype(float)
 
@@ -356,12 +362,32 @@ def format_review_summary(summary: dict[str, object]) -> str:
 
 
 def resolve_image_path(image_root: Path, prediction_path: str) -> Path:
-    """Resolve a predictions CSV image path against the local image root."""
+    """Resolve a predictions CSV image path against the local image root.
+
+    baseline.py writes repo-root-relative paths (e.g.
+    ``data/chexpert/PNG_valid/patient.../view.png``). When run from the repo
+    root that path resolves directly. When ``--image-root`` is given
+    explicitly, a naive ``image_root / path`` double-prefixes; fall back to
+    joining only the patient-relative tail so an explicit root still works.
+    """
     path = Path(prediction_path)
     if path.is_absolute() or path.exists():
         return path
 
-    return image_root / path
+    direct = image_root / path
+    if direct.exists():
+        return direct
+
+    try:
+        tail = path.relative_to(image_root)
+    except ValueError:
+        tail = None
+    if tail is not None:
+        rerooted = image_root / tail
+        if rerooted.exists():
+            return rerooted
+
+    return direct
 
 
 def model_target_label(label: str, pathologies: Iterable[str]) -> str:

@@ -47,6 +47,52 @@ def test_compute_label_aurocs_sorts_lowest_first() -> None:
     assert lowest_auroc_labels(aurocs, 1) == ["Edema"]
 
 
+def test_compute_label_aurocs_excludes_uncertain_labels() -> None:
+    # True regression test for the -1/NaN exclusion guard. The clean pair
+    # (true=0 @ 0.4, true=1 @ 0.6) has AUROC exactly 1.0. A CheXpert
+    # uncertain row (true=-1) with a *low* score (0.1) is neither positive
+    # nor negative, so it does not change n_pos/n_neg -- but if it is left
+    # in the ranking it pushes the positive row's rank from 2 to 3, giving
+    # (3 - 1) / (1 * 1) = 2.0. Without the isin guard this fixture yields
+    # AUROC 2.0; with it, exactly 1.0. NaN-pred row likewise must drop.
+    clean = pd.DataFrame(
+        {
+            "path": ["neg.png", "pos.png"],
+            "Edema_true": [0, 1],
+            "Edema_pred": [0.4, 0.6],
+        }
+    )
+    with_uncertain = pd.concat(
+        [
+            clean,
+            pd.DataFrame(
+                {
+                    "path": ["uncertain.png", "not_mentioned.png"],
+                    "Edema_true": [-1, np.nan],
+                    "Edema_pred": [0.1, 0.5],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    clean_auroc = compute_label_aurocs(clean, ["Edema"])["Edema"]
+    guarded_auroc = compute_label_aurocs(with_uncertain, ["Edema"])["Edema"]
+
+    assert math.isclose(clean_auroc, 1.0)
+    assert guarded_auroc <= 1.0
+    assert math.isclose(guarded_auroc, clean_auroc)
+
+
+# Note: select_error_cases applies the same explicit isin((0,1)) filter for
+# contract consistency with baseline.py / compute_label_aurocs, but its
+# false-positive/false-negative predicates (y_true == 0 / y_true == 1)
+# already exclude -1 rows structurally. No fixture can make that function's
+# output change when the explicit guard is removed, so there is no separate
+# regression test for it -- the guard is defensive documentation, not a
+# behavior change. The AUROC test above is the real regression guard.
+
+
 def test_select_error_cases_picks_confident_fp_and_fn() -> None:
     predictions = pd.DataFrame(
         {
