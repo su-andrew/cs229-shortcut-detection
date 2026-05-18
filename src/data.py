@@ -455,6 +455,16 @@ def _default_xrv_transform() -> Callable[[Any], Any]:
     )
 
 
+def default_xrv_transform() -> Callable[[Any], Any]:
+    """Return the standard TorchXRayVision crop/resize preprocessing."""
+    return _default_xrv_transform()
+
+
+def load_xray_image(image_path: str | Path) -> Any:
+    """Load and normalize a raster or DICOM chest X-ray as ``[1, H, W]``."""
+    return _load_xray_image(Path(image_path))
+
+
 def _load_xray_image(image_path: Path) -> Any:
     import torchxrayvision as xrv
 
