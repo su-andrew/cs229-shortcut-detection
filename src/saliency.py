@@ -442,22 +442,18 @@ def load_xray_tensor(image_path: Path, device: str = "cpu"):
     return tensor.to(torch.device(device))
 
 
-def render_gradcam(
-    model,
-    image_tensor,
-    target_label: str,
-    output_path: Path,
-    model_pathologies: list[str] | tuple[str, ...] | None = None,
-) -> None:
-    """Render one Grad-CAM overlay for a target CheXpert label."""
+def compute_gradcam(model, image_tensor, target_label, model_pathologies=None):
+    """Return the raw (224,224) Grad-CAM grayscale map for a target label.
+
+    image_tensor: batched torch tensor (1,1,224,224), same preprocessing as the
+    classifier input. Reuses the existing label-aliasing + norm5 target lines.
+    """
     try:
-        import matplotlib.pyplot as plt
         from pytorch_grad_cam import GradCAM
-        from pytorch_grad_cam.utils.image import show_cam_on_image
         from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Grad-CAM rendering needs matplotlib and pytorch-grad-cam installed."
+            "Grad-CAM needs pytorch-grad-cam installed."
         ) from exc
 
     pathologies = model_pathologies or getattr(model, "pathologies", None)
@@ -471,6 +467,28 @@ def render_gradcam(
 
     with GradCAM(model=model, target_layers=target_layers) as cam:
         grayscale_cam = cam(input_tensor=image_tensor, targets=targets)[0]
+    return grayscale_cam
+
+
+def render_gradcam(
+    model,
+    image_tensor,
+    target_label: str,
+    output_path: Path,
+    model_pathologies: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    """Render one Grad-CAM overlay for a target CheXpert label."""
+    try:
+        import matplotlib.pyplot as plt
+        from pytorch_grad_cam.utils.image import show_cam_on_image
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Grad-CAM rendering needs matplotlib and pytorch-grad-cam installed."
+        ) from exc
+
+    grayscale_cam = compute_gradcam(
+        model, image_tensor, target_label, model_pathologies=model_pathologies
+    )
 
     image = image_tensor.detach().cpu().numpy()[0, 0]
     image = image - image.min()
