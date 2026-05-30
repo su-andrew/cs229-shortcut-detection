@@ -53,8 +53,25 @@ def bootstrap_mean_ci(values, n_boot: int = 2000, seed: int = 229, alpha: float 
     return (float(arr.mean()), lo, hi)
 
 
-def compute_oll_rows(predictions, label, image_root, seg_model, model, device="cpu"):
-    """Per-image OLL for one label over scorable rows (y_true in {0,1})."""
+def is_frontal_path(path: str) -> bool:
+    """Heuristic: a CheXpert path is a frontal view unless it is marked lateral.
+
+    The xrv PSPNet lung segmenter is trained on frontal CXRs and produces empty
+    (0%-coverage) masks on lateral views, which would make every lateral score a
+    spurious OLL of 1.0. We restrict the OLL screen to frontal views and report
+    the lateral-segmenter failure as a limitation. CheXpert names lateral files
+    ``view2_lateral.png`` (frontals are ``view1_frontal.png``).
+    """
+    return "lateral" not in str(path).lower()
+
+
+def compute_oll_rows(predictions, label, image_root, seg_model, model, device="cpu",
+                     frontal_only=True):
+    """Per-image OLL for one label over scorable rows (y_true in {0,1}).
+
+    frontal_only=True drops lateral views, whose lung masks are invalid (see
+    is_frontal_path). Set False only to reproduce the confounded all-views run.
+    """
     import torch
 
     from src.data import default_xrv_transform, load_xray_image
@@ -67,6 +84,8 @@ def compute_oll_rows(predictions, label, image_root, seg_model, model, device="c
     frame = predictions[[path_col, true_column(label), pred_column(label)]].copy()
     frame.columns = ["path", "y_true", "y_pred"]
     frame = frame[frame["y_true"].isin((0.0, 1.0))]
+    if frontal_only:
+        frame = frame[frame["path"].map(is_frontal_path)]
 
     rows = []
     for rec in frame.itertuples(index=False):
@@ -102,6 +121,10 @@ def main():
     ap.add_argument("--num-labels", type=int, default=3)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--n-boot", type=int, default=2000)
+    ap.add_argument(
+        "--include-laterals", action="store_true",
+        help="Include lateral views (default: frontal-only; lateral lung masks are invalid).",
+    )
     args = ap.parse_args()
 
     from src.models import build_model
@@ -118,7 +141,10 @@ def main():
 
     summary = []
     for label in labels:
-        rows = compute_oll_rows(preds, label, args.image_root, seg, model, device=args.device)
+        rows = compute_oll_rows(
+            preds, label, args.image_root, seg, model, device=args.device,
+            frontal_only=not args.include_laterals,
+        )
         summary.append(summarize_label(label, rows, n_boot=args.n_boot))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

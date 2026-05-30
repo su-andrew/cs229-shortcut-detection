@@ -1,6 +1,12 @@
 import numpy as np
 
-from src.ola import bootstrap_mean_ci, stratify_oll
+from src.ola import bootstrap_mean_ci, is_frontal_path, stratify_oll
+
+
+def test_is_frontal_path_excludes_laterals():
+    assert is_frontal_path("data/chexpert/PNG_valid/patient1/study1/view1_frontal.png")
+    assert not is_frontal_path("data/chexpert/PNG_valid/patient1/study1/view2_lateral.png")
+    assert not is_frontal_path("SOME/PATH/VIEW_LATERAL.PNG")  # case-insensitive
 
 
 def test_bootstrap_mean_ci_resamples_image_rows_deterministically():
