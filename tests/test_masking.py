@@ -1,0 +1,49 @@
+import numpy as np
+import pytest
+
+from src.masking import make_shortcut_mask, apply_mask, delta_auroc
+
+
+def test_make_shortcut_mask_geometry():
+    corners = make_shortcut_mask("corners", shape=(224, 224), frac=0.15)
+    assert corners.dtype == bool and corners.shape == (224, 224)
+    assert corners[0, 0] and corners[-1, -1]
+    assert not corners[112, 112]
+    border = make_shortcut_mask("border", shape=(224, 224), frac=0.1)
+    assert border[0, :].all() and border[:, 0].all()
+    assert not border[112, 112]
+    lat = make_shortcut_mask("laterality", shape=(224, 224), frac=0.15)
+    assert lat[0, 0] and lat[0, -1]
+    assert not lat[-1, 112]
+
+
+def test_make_shortcut_mask_rejects_unknown_and_oversized():
+    with pytest.raises(ValueError):
+        make_shortcut_mask("nonsense")
+    with pytest.raises(ValueError):
+        make_shortcut_mask("corners", frac=0.9)  # would mask whole image
+
+
+def test_apply_mask_mean_fill_replaces_region():
+    # non-uniform image so mean-fill is a real, detectable change
+    plane = np.arange(224 * 224, dtype="float32").reshape(224, 224)
+    img = plane[None, :, :].copy()  # (1,224,224)
+    expected_mean = float(plane.mean())
+    mask = make_shortcut_mask("corners", shape=(224, 224), frac=0.15)
+
+    out = apply_mask(img, mask, fill="mean")
+    assert out.dtype == np.float32
+    assert np.allclose(out[0][mask], expected_mean)        # masked -> global mean
+    assert np.allclose(out[0][~mask], plane[~mask])         # rest untouched
+    assert np.array_equal(img, plane[None, :, :])           # input not mutated
+
+    out0 = apply_mask(img, mask, fill="zero")
+    assert np.allclose(out0[0][mask], 0.0)
+
+
+def test_delta_auroc_positive_when_masking_hurts():
+    y_true = np.array([1, 1, 0, 0])
+    clean = np.array([0.9, 0.8, 0.2, 0.1])
+    masked = np.array([0.4, 0.6, 0.5, 0.55])
+    d = delta_auroc(y_true, clean, masked)
+    assert d > 0
