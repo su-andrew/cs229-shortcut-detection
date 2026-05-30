@@ -83,6 +83,36 @@ def _map_labels_to_indices(labels: list[str], pathologies: list[str]) -> dict[st
     return label_to_index
 
 
+def predict_dataset(model, dataset, labels, label_to_index, device="cpu",
+                    image_transform=None):
+    """Run inference over a dataset -> predictions DataFrame.
+
+    image_transform: optional callable applied to each (1,224,224) image tensor
+    before the forward pass (R3 masking uses this). Identity if None.
+    """
+    import torch
+
+    rows = []
+    n = len(dataset)
+    with torch.no_grad():
+        for i in range(n):
+            sample = dataset[i]
+            image = sample["image"]
+            if not torch.is_tensor(image):
+                image = torch.as_tensor(np.asarray(image), dtype=torch.float32)
+            if image_transform is not None:
+                image = image_transform(image)
+            image = image.float().unsqueeze(0).to(device)
+            probs = model(image)[0].detach().cpu().numpy()
+            true = np.asarray(sample["labels"], dtype="float32")
+            row = {"path": str(sample["image_path"])}
+            for j, label in enumerate(labels):
+                row[f"{label}_true"] = float(true[j])
+                row[f"{label}_pred"] = float(probs[label_to_index[label]])
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def run_baseline(
     config: dict,
     data_root: Path | None = None,
@@ -120,29 +150,10 @@ def run_baseline(
             "to populate data/chexpert/ first."
         )
 
-    rows: list[dict] = []
     print(f"Running baseline over {n} validation images on {device} ...")
-    with torch.no_grad():
-        for i in range(n):
-            sample = dataset[i]
-            image = sample["image"]
-            if not torch.is_tensor(image):
-                image = torch.as_tensor(np.asarray(image), dtype=torch.float32)
-            # dataset yields [1, 224, 224]; model wants [B, 1, 224, 224]
-            image = image.float().unsqueeze(0).to(device)
-            probs = model(image)[0].detach().cpu().numpy()  # xrv: sigmoid outputs
-
-            true = np.asarray(sample["labels"], dtype="float32")
-            row = {"path": str(sample["image_path"])}
-            for j, label in enumerate(labels):
-                row[f"{label}_true"] = float(true[j])
-                row[f"{label}_pred"] = float(probs[label_to_index[label]])
-            rows.append(row)
-
-            if (i + 1) % 25 == 0 or (i + 1) == n:
-                print(f"  {i + 1}/{n}")
-
-    predictions = pd.DataFrame(rows)
+    predictions = predict_dataset(
+        model, dataset, labels, label_to_index, device=device
+    )
 
     auroc_rows = []
     for label in labels:
