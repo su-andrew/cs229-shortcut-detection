@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.segmentation import binarize_lung_logits, resample_to_224
+from src.segmentation import binarize_lung_logits, resample_to_224, union_lung_mask
 
 
 def test_resample_to_224_shape():
