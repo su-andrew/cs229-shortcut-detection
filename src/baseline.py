@@ -98,10 +98,12 @@ def predict_dataset(model, dataset, labels, label_to_index, device="cpu",
         for i in range(n):
             sample = dataset[i]
             image = sample["image"]
-            if not torch.is_tensor(image):
-                image = torch.as_tensor(np.asarray(image), dtype=torch.float32)
             if image_transform is not None:
                 image = image_transform(image)
+            # Coerce AFTER the transform too: a transform may return a NumPy
+            # array (e.g. masking ops), which would crash at .float().
+            if not torch.is_tensor(image):
+                image = torch.as_tensor(np.asarray(image), dtype=torch.float32)
             image = image.float().unsqueeze(0).to(device)
             probs = model(image)[0].detach().cpu().numpy()
             true = np.asarray(sample["labels"], dtype="float32")
