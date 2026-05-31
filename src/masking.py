@@ -42,6 +42,8 @@ def apply_mask(image_224, mask, fill: str = "mean"):
     """Return a copy of a (1,224,224) image with masked pixels filled."""
     import torch
 
+    if fill not in ("mean", "zero"):
+        raise ValueError(f"unknown fill: {fill!r} (expected 'mean' or 'zero')")
     is_tensor = torch.is_tensor(image_224)
     arr = image_224.detach().cpu().numpy() if is_tensor else np.asarray(image_224)
     arr = arr.copy()
@@ -52,13 +54,23 @@ def apply_mask(image_224, mask, fill: str = "mean"):
     return arr.astype(np.float32)
 
 
+def rank_sort(df: pd.DataFrame) -> pd.DataFrame:
+    """Order results by ΔAUROC, but keep gate-passing (ranked) diseases above
+    unranked ones so a degenerate/low-n disease never tops the table on a noisy
+    ΔAUROC."""
+    return df.sort_values(["ranked", "delta_auroc"], ascending=[False, False])
+
+
 def delta_auroc(y_true, clean_pred, masked_pred) -> float:
     """AUROC(clean) - AUROC(masked) on the clean 0/1 subset."""
     from sklearn.metrics import roc_auc_score
 
-    y = np.asarray(y_true); valid = np.isin(y, (0, 1))
+    y = np.asarray(y_true)
+    c_all = np.asarray(clean_pred, dtype="float64")
+    m_all = np.asarray(masked_pred, dtype="float64")
+    valid = np.isin(y, (0, 1)) & np.isfinite(c_all) & np.isfinite(m_all)
     y = y[valid].astype(int)
-    c = np.asarray(clean_pred)[valid]; m = np.asarray(masked_pred)[valid]
+    c = c_all[valid]; m = m_all[valid]
     if len(np.unique(y)) < 2:
         return float("nan")
     return float(roc_auc_score(y, c) - roc_auc_score(y, m))
@@ -116,7 +128,7 @@ def main():
         })
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(rows).sort_values("delta_auroc", ascending=False)
+    df = rank_sort(pd.DataFrame(rows))
     out = args.output_dir / "masked_sensitivity.csv"
     df.to_csv(out, index=False)
     print(df.to_string(index=False))

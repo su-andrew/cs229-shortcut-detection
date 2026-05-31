@@ -1,7 +1,8 @@
 import numpy as np
+import pandas as pd
 import pytest
 
-from src.masking import make_shortcut_mask, apply_mask, delta_auroc
+from src.masking import make_shortcut_mask, apply_mask, delta_auroc, rank_sort
 
 
 def test_make_shortcut_mask_geometry():
@@ -41,9 +42,39 @@ def test_apply_mask_mean_fill_replaces_region():
     assert np.allclose(out0[0][mask], 0.0)
 
 
+def test_apply_mask_rejects_unknown_fill():
+    img = np.ones((1, 4, 4), dtype="float32")
+    mask = np.zeros((4, 4), dtype=bool)
+    with pytest.raises(ValueError):
+        apply_mask(img, mask, fill="median")
+
+
 def test_delta_auroc_positive_when_masking_hurts():
     y_true = np.array([1, 1, 0, 0])
     clean = np.array([0.9, 0.8, 0.2, 0.1])
     masked = np.array([0.4, 0.6, 0.5, 0.55])
     d = delta_auroc(y_true, clean, masked)
     assert d > 0
+
+
+def test_delta_auroc_ignores_nonfinite_predictions():
+    # A NaN prediction row must be dropped, not crash roc_auc_score.
+    y_true = np.array([1, 1, 0, 0])
+    clean = np.array([0.9, 0.8, 0.2, 0.1])           # perfect ranking on valid rows
+    masked = np.array([0.9, np.nan, 0.2, 0.1])        # one NaN -> drop that row
+    d = delta_auroc(y_true, clean, masked)
+    # surviving rows (drop the NaN) are perfectly ranked in both clean and
+    # masked -> AUROC 1.0 each -> ΔAUROC exactly 0.0 (finite, not just non-NaN)
+    assert d == pytest.approx(0.0)
+
+
+def test_rank_sort_keeps_ranked_above_unranked():
+    df = pd.DataFrame([
+        {"label": "lowDelta_ranked", "delta_auroc": 0.01, "ranked": True},
+        {"label": "highDelta_unranked", "delta_auroc": 0.50, "ranked": False},
+        {"label": "highDelta_ranked", "delta_auroc": 0.30, "ranked": True},
+    ])
+    order = list(rank_sort(df)["label"])
+    # both ranked rows come first (sorted by ΔAUROC), unranked last despite its
+    # larger ΔAUROC
+    assert order == ["highDelta_ranked", "lowDelta_ranked", "highDelta_unranked"]
