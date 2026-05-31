@@ -53,6 +53,22 @@ def bootstrap_mean_ci(values, n_boot: int = 2000, seed: int = 229, alpha: float 
     return (float(arr.mean()), lo, hi)
 
 
+def is_degenerate_mask(mask) -> bool:
+    """True if a lung mask is empty (all-False / all-zero).
+
+    ``attribution_outside_mask`` returns 1.0 for ANY CAM when the mask is empty
+    (all attribution is "outside" a mask that covers nothing), so a segmentation
+    failure on a frontal view would silently contribute a spurious OLL of 1.0 and
+    inflate the per-disease mean. Such images are skipped and counted, not scored.
+
+    Only the empty (all-False / all-zero) case is treated as degenerate. An
+    all-True mask is the opposite failure (it *deflates* OLL toward 0 rather than
+    inflating it) and is left in; ``lung_mask`` always returns a boolean array, so
+    NaN inputs do not arise here.
+    """
+    return not np.asarray(mask).astype(bool).any()
+
+
 def is_frontal_path(path: str) -> bool:
     """Heuristic: a CheXpert path is a frontal view unless it is marked lateral.
 
@@ -88,18 +104,24 @@ def compute_oll_rows(predictions, label, image_root, seg_model, model, device="c
         frame = frame[frame["path"].map(is_frontal_path)]
 
     rows = []
+    n_empty_mask = 0
     for rec in frame.itertuples(index=False):
         p = resolve_image_path(Path(image_root), str(rec.path))
         img = default_xrv_transform()(load_xray_image(p))           # (1,224,224)
+        mask = lung_mask(seg_model, img, device=device)             # (224,224) bool
+        if is_degenerate_mask(mask):
+            # Empty lung mask → attribution_outside_mask would return a spurious
+            # 1.0 for any CAM. Skip and count rather than inflate the OLL mean.
+            n_empty_mask += 1
+            continue
         tensor = torch.as_tensor(img, dtype=torch.float32).unsqueeze(0).to(device)
         cam = compute_gradcam(model, tensor, label)                  # (224,224)
-        mask = lung_mask(seg_model, img, device=device)             # (224,224) bool
         oll = attribution_outside_mask(cam, mask)
         rows.append({"y_true": int(rec.y_true), "y_pred": float(rec.y_pred), "oll": oll})
-    return rows
+    return rows, n_empty_mask
 
 
-def summarize_label(label, rows, n_boot=2000, seed=229):
+def summarize_label(label, rows, n_boot=2000, seed=229, n_empty_mask=0):
     strata = stratify_oll(rows)
     n_pos, n_neg = len(strata["y1"]), len(strata["y0"])
     mean, lo, hi = bootstrap_mean_ci(strata["y1"], n_boot=n_boot, seed=seed)  # primary = y_true==1
@@ -108,7 +130,7 @@ def summarize_label(label, rows, n_boot=2000, seed=229):
         "oll_neg_mean": float(np.mean(strata["y0"])) if n_neg else float("nan"),
         "oll_fp_mean": float(np.mean(strata["fp"])) if strata["fp"] else float("nan"),
         "oll_fn_mean": float(np.mean(strata["fn"])) if strata["fn"] else float("nan"),
-        "n_pos": n_pos, "n_neg": n_neg, "n_boot": n_boot,
+        "n_pos": n_pos, "n_neg": n_neg, "n_empty_mask": n_empty_mask, "n_boot": n_boot,
         "ranked": bool(n_pos >= MIN_N and n_neg >= MIN_N),
     }
 
@@ -141,11 +163,15 @@ def main():
 
     summary = []
     for label in labels:
-        rows = compute_oll_rows(
+        rows, n_empty_mask = compute_oll_rows(
             preds, label, args.image_root, seg, model, device=args.device,
             frontal_only=not args.include_laterals,
         )
-        summary.append(summarize_label(label, rows, n_boot=args.n_boot))
+        if n_empty_mask:
+            print(f"[{label}] skipped {n_empty_mask} image(s) with empty lung masks")
+        summary.append(
+            summarize_label(label, rows, n_boot=args.n_boot, n_empty_mask=n_empty_mask)
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(summary).sort_values("oll_pos_mean", ascending=False)

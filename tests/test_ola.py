@@ -1,6 +1,33 @@
 import numpy as np
 
-from src.ola import bootstrap_mean_ci, is_frontal_path, stratify_oll
+from src.ola import (
+    bootstrap_mean_ci,
+    is_degenerate_mask,
+    is_frontal_path,
+    stratify_oll,
+    summarize_label,
+)
+
+
+def test_is_degenerate_mask_flags_empty_masks():
+    # An all-False mask makes attribution_outside_mask return 1.0 for ANY CAM,
+    # silently inflating OLL. Such images must be skipped, not scored.
+    assert is_degenerate_mask(np.zeros((4, 4), dtype=bool))
+    assert is_degenerate_mask(np.zeros((4, 4)))  # numeric zeros too
+    assert not is_degenerate_mask(np.array([[False, True], [False, False]]))
+    assert not is_degenerate_mask(np.ones((4, 4), dtype=bool))
+
+
+def test_summarize_label_reports_n_empty_mask():
+    rows = [
+        {"y_true": 1, "y_pred": 0.9, "oll": 0.3},
+        {"y_true": 0, "y_pred": 0.1, "oll": 0.5},
+    ]
+    summary = summarize_label("Edema", rows, n_boot=100, n_empty_mask=7)
+    assert summary["n_empty_mask"] == 7
+    assert summary["n_pos"] == 1 and summary["n_neg"] == 1
+    # default is 0 when no empties were skipped
+    assert summarize_label("Edema", rows, n_boot=100)["n_empty_mask"] == 0
 
 
 def test_is_frontal_path_excludes_laterals():
