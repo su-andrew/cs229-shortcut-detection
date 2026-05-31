@@ -35,3 +35,11 @@ def test_union_lung_mask_no_logit_cancellation():
     # (6 + -6 = 0 -> sigmoid 0.5, not > 0.5), proving the bug is avoided.
     summed = binarize_lung_logits(stack.sum(axis=0), threshold=0.5)
     assert summed.tolist() == [[False, False], [False, False]]
+
+
+def test_union_lung_mask_rejects_non_3d_input():
+    # A 2D (single-channel) map would silently collapse to 1D via max(axis=0);
+    # the (C,H,W) contract must fail loudly instead.
+    two_d = np.zeros((4, 4), dtype="float32")
+    with pytest.raises(ValueError):
+        union_lung_mask(two_d)

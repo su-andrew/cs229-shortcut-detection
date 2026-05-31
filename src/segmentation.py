@@ -41,6 +41,11 @@ def union_lung_mask(lung_logits, threshold: float = 0.5) -> np.ndarray:
     (inflating any downstream "attribution outside the lung" metric).
     """
     logits = np.asarray(lung_logits, dtype="float64")
+    if logits.ndim != 3:
+        raise ValueError(
+            "lung_logits must have shape (C, H, W); got "
+            f"{logits.ndim}D array with shape {logits.shape}"
+        )
     probs = 1.0 / (1.0 + np.exp(-logits))
     union_prob = probs.max(axis=0)
     return union_prob > threshold
