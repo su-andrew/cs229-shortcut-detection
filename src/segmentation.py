@@ -25,9 +25,25 @@ def resample_to_224(arr: np.ndarray) -> np.ndarray:
 
 
 def binarize_lung_logits(logits_224: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-    """Sigmoid + threshold a lung-logit map to a boolean mask."""
+    """Sigmoid + threshold a single lung-logit map to a boolean mask."""
     probs = 1.0 / (1.0 + np.exp(-np.asarray(logits_224, dtype="float64")))
     return probs > threshold
+
+
+def union_lung_mask(lung_logits, threshold: float = 0.5) -> np.ndarray:
+    """Union per-lung logit channels into one boolean mask.
+
+    Takes a (C, H, W) stack of lung-channel LOGITS (e.g. Left Lung, Right
+    Lung), applies the sigmoid PER CHANNEL, and unions via the max probability
+    across channels before thresholding. This avoids the cancellation bug of
+    summing logits first: at a left-lung pixel the right-lung logit is usually
+    strongly negative, and summing logits would erode the true lung mask
+    (inflating any downstream "attribution outside the lung" metric).
+    """
+    logits = np.asarray(lung_logits, dtype="float64")
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    union_prob = probs.max(axis=0)
+    return union_prob > threshold
 
 
 def load_lung_segmenter(device: str = "cpu"):
@@ -62,9 +78,13 @@ def lung_mask(seg_model, image_224, device: str = "cpu", threshold: float = 0.5)
         seg_out = seg_model(t)  # (1,14,512,512)
     targets = list(seg_model.targets)
     idx = [targets.index(name) for name in LUNG_TARGETS]
-    lungs_512 = seg_out[0, idx].sum(dim=0).detach().cpu().numpy()  # (512,512) logits
-    lungs_224 = resample_to_224(lungs_512)
-    return binarize_lung_logits(lungs_224, threshold=threshold)
+    # Per-channel logits (C,512,512); resample each, then union via per-channel
+    # sigmoid + max. Do NOT sum logits across lungs (cancellation erodes mask).
+    lung_logits_512 = seg_out[0, idx].detach().cpu().numpy()  # (C,512,512) logits
+    lung_logits_224 = np.stack(
+        [resample_to_224(ch) for ch in lung_logits_512], axis=0
+    )  # (C,224,224)
+    return union_lung_mask(lung_logits_224, threshold=threshold)
 
 
 def overlay_mask(image_224, mask, output_path: Path) -> None:
