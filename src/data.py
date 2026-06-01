@@ -17,6 +17,10 @@ import pandas as pd
 CHEXPERT_DATA_DIR = Path("data/chexpert")
 CHEXPERT_IMAGE_DIRNAME = "PNG_valid"
 CHEXPERT_METADATA_FILENAME = "metadata.csv"
+# Train-split counterparts (linear probe). PNG_train is the ~223k-image train
+# table on Redivis; we sample from it rather than pulling it whole.
+CHEXPERT_TRAIN_IMAGE_DIRNAME = "PNG_train"
+CHEXPERT_TRAIN_METADATA_FILENAME = "metadata_train.csv"
 
 # The five CheXpert competition labels. Default label set for the dataset so
 # the `sample["labels"]` contract holds without the caller having to pass them.
@@ -102,6 +106,7 @@ def _load_chexbert_labels(
     dataset_ref: str,
     labels_table: str,
     label_file: str,
+    split: str = "valid",
 ) -> pd.DataFrame:
     table = _redivis_table(redivis, dataset_ref, labels_table)
     files = list(table.list_files())
@@ -117,7 +122,7 @@ def _load_chexbert_labels(
     # it via StringIO rather than `.splitlines()` so we don't also materialize
     # a second full list of ~223k line strings.
     text = match.read(as_text=True)
-    return _parse_chexbert_jsonl(io.StringIO(text))
+    return _parse_chexbert_jsonl(io.StringIO(text), split=split)
 
 
 def fetch_chexpert_valid(
@@ -198,6 +203,158 @@ def fetch_chexpert_valid(
 
     merged.to_csv(metadata_csv, index=False)
 
+    return CheXpertValidPaths(
+        root=output_path, image_dir=image_dir, metadata_csv=metadata_csv
+    )
+
+
+def _download_train_images(
+    redivis: Any,
+    dataset_ref: str,
+    image_table: str,
+    file_paths: Iterable[str],
+    image_dir: Path,
+    *,
+    overwrite: bool,
+    progress: bool,
+) -> pd.DataFrame:
+    """Selectively download named files from a large image table.
+
+    Unlike ``_download_valid_images`` (which pulls the whole 234-image table),
+    PNG_train has ~223k files, so we fetch only the sampled ``file_paths``
+    one at a time via ``table.file(path).download(...)``. Each file lands at
+    ``image_dir/<path>`` (sub-dirs created). Missing files are recorded and
+    skipped, not fatal — the join is image-authoritative downstream."""
+    table = _redivis_table(redivis, dataset_ref, image_table)
+    written: list[str] = []
+    missing: list[str] = []
+    paths = list(file_paths)
+    for i, rel in enumerate(paths, 1):
+        dest = image_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and not overwrite:
+            written.append(rel)
+            continue
+        try:
+            table.file(rel).download(str(dest), overwrite=overwrite, progress=False)
+            written.append(rel)
+        except Exception as exc:  # noqa: BLE001
+            # Only a genuine "file not present in the table" is skippable. Auth,
+            # network, disk, and API errors must surface — silently dropping them
+            # would return a quietly-shrunken (and possibly biased) train sample.
+            if type(exc).__name__ != "NotFoundError":
+                raise RuntimeError(
+                    f"Download of {rel!r} from {image_table!r} failed with "
+                    f"{type(exc).__name__}: {exc}. Aborting rather than returning "
+                    "a partial sample (check token / network / disk)."
+                ) from exc
+            missing.append(rel)
+            if progress:
+                print(f"  [skip-missing] {rel}")
+        if progress and (i % 200 == 0 or i == len(paths)):
+            print(f"  downloaded {len(written)}/{len(paths)} (missing {len(missing)})")
+
+    # Guard against a silently-shrunken sample: a derivation regression would
+    # make most files 404. Tolerate a few genuinely-missing files, not a flood.
+    n_req = len(paths)
+    if not written:
+        raise RuntimeError(
+            f"No train images downloaded from {image_table!r}; check the "
+            "file-path derivation (PNG_train resolves split-stripped .png paths)."
+        )
+    if n_req and len(missing) > max(10, int(0.1 * n_req)):
+        raise RuntimeError(
+            f"{len(missing)}/{n_req} train images were not found in {image_table!r} "
+            "(>10% missing) — likely a file-path derivation regression, not real "
+            "absences. Aborting rather than writing a shrunken sample."
+        )
+    return pd.DataFrame({"file_name": written})
+
+
+def fetch_chexpert_train(
+    output_dir: str | Path = CHEXPERT_DATA_DIR,
+    *,
+    n: int = 2000,
+    seed: int = 229,
+    dataset_ref: str | None = None,
+    image_table: str = CHEXPERT_TRAIN_IMAGE_DIRNAME,
+    master_table: str = CHEXPERT_MASTER_TABLE,
+    labels_table: str = CHEXPERT_LABELS_TABLE,
+    label_file: str = CHEXPERT_LABEL_FILE,
+    image_dirname: str = CHEXPERT_TRAIN_IMAGE_DIRNAME,
+    metadata_filename: str = CHEXPERT_TRAIN_METADATA_FILENAME,
+    overwrite: bool = False,
+    progress: bool = True,
+) -> CheXpertValidPaths:
+    """Download a random ``n``-image sample of the CheXpert Plus TRAIN split
+    from Redivis and write a merged ``metadata_train.csv``.
+
+    Mirrors ``fetch_chexpert_valid`` but (1) filters the master to the train
+    split, (2) randomly samples ``n`` rows (seeded), (3) selectively downloads
+    only those images from PNG_train (the table is too large to pull whole),
+    and (4) joins the same 3 sources on the canonical path stem. Labels remain
+    CheXbert ``impression_fixed`` extractions, NOT radiologist gold."""
+    import redivis
+
+    dataset_ref = dataset_ref or os.getenv("CHEXPERT_REDIVIS_DATASET")
+    if dataset_ref is None or len(dataset_ref.split(".")) != 2:
+        raise ValueError(
+            "A 2-part 'owner.dataset' Redivis reference is required: set "
+            "the CHEXPERT_REDIVIS_DATASET env var or pass dataset_ref= "
+            f"(e.g. 'AIMI.chexpert_plus'). Got {dataset_ref!r}."
+        )
+
+    output_path = Path(output_dir)
+    image_dir = output_path / image_dirname
+    metadata_csv = output_path / metadata_filename
+    output_path.mkdir(parents=True, exist_ok=True)
+    image_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. master -> train split -> seeded n-sample. Demographics + path only.
+    master_table_obj = _redivis_table(redivis, dataset_ref, master_table)
+    master_cols = ["path_to_image", "split", *CHEXPERT_DEMOGRAPHIC_COLUMNS]
+    master_full = master_table_obj.to_pandas_dataframe(
+        variables=master_cols, progress=False
+    )
+    train_master = _filter_master(master_full, split="train")
+    sampled = _sample_rows(train_master, n=n, seed=seed)
+    if progress:
+        print(f"sampled {len(sampled)} train rows (requested n={n}, seed={seed})")
+
+    # 2. selective image download (PNG_train resolves split-stripped .png paths)
+    file_paths = [_png_train_file_path(p) for p in sampled["path_to_image"]]
+    images_df = _download_train_images(
+        redivis, dataset_ref, image_table, file_paths, image_dir,
+        overwrite=overwrite, progress=progress,
+    )
+
+    # 3. labels: parse the train-split CheXbert JSONL, then keep only the stems
+    #    we actually sampled (bounds the in-memory frame to ~n rows).
+    labels_full = _load_chexbert_labels(
+        redivis, dataset_ref, labels_table, label_file, split="train"
+    )
+    sampled_stems = set(images_df["file_name"].map(_chexpert_path_stem))
+    labels_df = labels_full[
+        labels_full["path_to_image"].map(_chexpert_path_stem).isin(sampled_stems)
+    ].reset_index(drop=True)
+
+    merged = merge_chexpert_sources(images_df, sampled, labels_df)
+
+    label_stems = set(labels_df["path_to_image"].map(_chexpert_path_stem))
+    img_stems = images_df["file_name"].map(_chexpert_path_stem)
+    n_joined = int(img_stems.isin(label_stems).sum())
+    print(f"{n_joined}/{len(images_df)} train images joined to a CheXbert label row")
+
+    print("per-label class balance (1=pos, 0=neg; -1/NaN = uncertain/not mentioned):")
+    for label in CHEXPERT_COMPETITION_LABELS:
+        col = merged[label]
+        n_pos = int((col == 1.0).sum())
+        n_neg = int((col == 0.0).sum())
+        n_other = len(merged) - n_pos - n_neg
+        warn = "  [WARNING: <2 classes]" if (n_pos == 0 or n_neg == 0) else ""
+        print(f"  {label}: pos={n_pos} neg={n_neg} uncertain/unlabeled={n_other}{warn}")
+
+    merged.to_csv(metadata_csv, index=False)
     return CheXpertValidPaths(
         root=output_path, image_dir=image_dir, metadata_csv=metadata_csv
     )
@@ -328,14 +485,37 @@ def _redivis_table(redivis: Any, dataset_ref: str | None, table_ref: str) -> Any
 
 
 def _chexpert_path_stem(path: str) -> str:
-    """Canonical join key: drop a leading 'valid/' split prefix and the
-    file extension so PNG image names, the master table, and the CheXbert
-    label JSONL all collapse to 'patient<ID>/study<N>/view<N>_<view>'."""
+    """Canonical join key: drop a leading split prefix ('valid/' or 'train/')
+    and the file extension so PNG image names, the master table, and the
+    CheXbert label JSONL all collapse to 'patient<ID>/study<N>/view<N>_<view>'.
+
+    Stripping the split prefix is what lets the 3-source join align on either
+    split; keeping 'train/' on only some sources would silently produce
+    all-NaN labels (the milestone label-mismatch failure mode)."""
     text = str(path)
-    if text.startswith("valid/"):
-        text = text[len("valid/"):]
+    for prefix in ("valid/", "train/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
     root, _, ext = text.rpartition(".")
     return root if root else text
+
+
+def _png_train_file_path(path_to_image: str) -> str:
+    """Map a master ``path_to_image`` to the path ``PNG_train.file()`` resolves.
+
+    Verified against Redivis 2026-05-31: the master stores
+    'train/patient.../study.../view..._frontal.jpg' but PNG_train resolves the
+    split-stripped, .png-extensioned path
+    'patient.../study.../view..._frontal.png'."""
+    text = str(path_to_image)
+    for prefix in ("train/", "valid/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    root, _, ext = text.rpartition(".")
+    base = root if root else text
+    return f"{base}.png"
 
 
 def _dedup_by_stem(frame: pd.DataFrame, source_name: str) -> pd.DataFrame:
@@ -363,18 +543,20 @@ def _dedup_by_stem(frame: pd.DataFrame, source_name: str) -> pd.DataFrame:
     return frame.drop_duplicates(subset=["_stem"], keep="first")
 
 
-def _parse_chexbert_jsonl(lines: Iterable[str]) -> pd.DataFrame:
-    """Parse CheXbert JSON-Lines into a DataFrame, keeping only valid-split
-    rows and the 'path_to_image' + 5 competition-label columns. Iterates
-    the given lines once; values stay raw (1.0 / 0.0 / -1.0 / NaN)."""
+def _parse_chexbert_jsonl(lines: Iterable[str], split: str = "valid") -> pd.DataFrame:
+    """Parse CheXbert JSON-Lines into a DataFrame, keeping only rows whose
+    ``path_to_image`` starts with ``{split}/`` and the 'path_to_image' + 5
+    competition-label columns. Iterates the given lines once; values stay raw
+    (1.0 / 0.0 / -1.0 / NaN). ``split`` defaults to 'valid' (back-compat)."""
     keep = ["path_to_image", *CHEXPERT_COMPETITION_LABELS]
+    prefix = f"{split}/"
     records = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
         obj = json.loads(stripped)
-        if not str(obj.get("path_to_image", "")).startswith("valid/"):
+        if not str(obj.get("path_to_image", "")).startswith(prefix):
             continue
         records.append({col: obj.get(col) for col in keep})
 
@@ -384,11 +566,27 @@ def _parse_chexbert_jsonl(lines: Iterable[str]) -> pd.DataFrame:
     return frame
 
 
-def _filter_valid_master(master: pd.DataFrame) -> pd.DataFrame:
-    """Keep valid-split rows and the path + demographic columns from the
-    CheXpert Plus master metadata table."""
+def _filter_master(master: pd.DataFrame, split: str = "valid") -> pd.DataFrame:
+    """Keep rows for the requested split and the path + demographic columns
+    from the CheXpert Plus master metadata table. ``split`` defaults to
+    'valid' (back-compat)."""
     columns = ["path_to_image", "split", *CHEXPERT_DEMOGRAPHIC_COLUMNS]
-    return master.loc[master["split"] == "valid", columns].reset_index(drop=True)
+    return master.loc[master["split"] == split, columns].reset_index(drop=True)
+
+
+def _filter_valid_master(master: pd.DataFrame) -> pd.DataFrame:
+    """Back-compat thin wrapper: valid-split rows + path/demographic columns."""
+    return _filter_master(master, split="valid")
+
+
+def _sample_rows(frame: pd.DataFrame, n: int, seed: int = 229) -> pd.DataFrame:
+    """Deterministically sample up to ``n`` rows (seeded). Returns all rows if
+    ``n >= len(frame)`` — no upsampling, no error."""
+    if n <= 0:
+        raise ValueError(f"n must be a positive integer, got {n!r}")
+    if n >= len(frame):
+        return frame.reset_index(drop=True)
+    return frame.sample(n=n, random_state=seed).reset_index(drop=True)
 
 
 def merge_chexpert_sources(
@@ -591,6 +789,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Overwrite existing local files instead of skipping them.",
     )
+
+    # fetch-train: random n-image sample of the TRAIN split (for the linear probe)
+    train_parser = subparsers.add_parser(
+        "fetch-train",
+        help="Download a random n-image sample of the CheXpert Plus TRAIN split.",
+        description=(
+            "Sample n train-split images from CheXpert Plus on Redivis (selective "
+            "download from PNG_train), join demographics + CheXbert labels, and "
+            "write metadata_train.csv. Requires REDIVIS_API_TOKEN. The val 'fetch' "
+            "subcommand is untouched."
+        ),
+    )
+    train_parser.add_argument("--dataset-ref", default=None,
+        help="2-part 'owner.dataset' Redivis reference (or CHEXPERT_REDIVIS_DATASET env var).")
+    train_parser.add_argument("--n", type=int, default=2000,
+        help="Number of train images to sample (default: 2000).")
+    train_parser.add_argument("--seed", type=int, default=229,
+        help="Random seed for the sample (default: 229).")
+    train_parser.add_argument("--train-image-table", default=CHEXPERT_TRAIN_IMAGE_DIRNAME,
+        help=f"Redivis train-image table name (default: {CHEXPERT_TRAIN_IMAGE_DIRNAME}).")
+    train_parser.add_argument("--master-table", default=CHEXPERT_MASTER_TABLE,
+        help=f"Master demographics table (default: {CHEXPERT_MASTER_TABLE}).")
+    train_parser.add_argument("--labels-table", default=CHEXPERT_LABELS_TABLE,
+        help=f"CheXbert labels table (default: {CHEXPERT_LABELS_TABLE}).")
+    train_parser.add_argument("--label-file", default=CHEXPERT_LABEL_FILE,
+        help=f"CheXbert JSONL file within the labels table (default: {CHEXPERT_LABEL_FILE}).")
+    train_parser.add_argument("--output-dir", default=str(CHEXPERT_DATA_DIR),
+        help=f"Local output directory (default: {CHEXPERT_DATA_DIR}).")
+    train_parser.add_argument("--overwrite", action="store_true",
+        help="Overwrite existing local files instead of skipping them.")
     return parser
 
 
@@ -608,6 +836,22 @@ def main(argv: list[str] | None = None) -> None:
             overwrite=args.overwrite,
         )
         print("Fetched CheXpert Plus validation data:")
+        print(f"  images:   {paths.image_dir}")
+        print(f"  metadata: {paths.metadata_csv}")
+
+    elif args.command == "fetch-train":
+        paths = fetch_chexpert_train(
+            output_dir=args.output_dir,
+            n=args.n,
+            seed=args.seed,
+            dataset_ref=args.dataset_ref,
+            image_table=args.train_image_table,
+            master_table=args.master_table,
+            labels_table=args.labels_table,
+            label_file=args.label_file,
+            overwrite=args.overwrite,
+        )
+        print("Fetched CheXpert Plus train sample:")
         print(f"  images:   {paths.image_dir}")
         print(f"  metadata: {paths.metadata_csv}")
 
