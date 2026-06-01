@@ -221,37 +221,44 @@ def _download_train_images(
     """Selectively download named files from a large image table.
 
     Unlike ``_download_valid_images`` (which pulls the whole 234-image table),
-    PNG_train has ~223k files, so we fetch only the sampled ``file_paths``
-    one at a time via ``table.file(path).download(...)``. Each file lands at
-    ``image_dir/<path>`` (sub-dirs created). Missing files are recorded and
-    skipped, not fatal — the join is image-authoritative downstream."""
+    PNG_train has ~223k files, so we fetch only the sampled ``file_paths``,
+    one ``table.file(rel).download(...)`` per image. We deliberately do NOT wrap
+    this in our own thread pool: redivis' ``download`` already parallelizes each
+    file into byte-range slices with its own internal ThreadPoolExecutor, so an
+    outer pool nests thread pools and deadlocks (observed: hard hang at ~290
+    images). Sequential here = the file-level parallelism redivis intends.
+
+    Each file lands at ``image_dir/<path>`` via a ``.part`` temp + atomic rename,
+    so an interrupted download never leaves a truncated file a later
+    ``overwrite=False`` retry would skip as 'ok'. A genuinely-absent file
+    (NotFoundError) is recorded and skipped; any other error (auth, network,
+    disk) aborts — silently dropping it would return a biased partial sample."""
     table = _redivis_table(redivis, dataset_ref, image_table)
+    paths = list(file_paths)
     written: list[str] = []
     missing: list[str] = []
-    paths = list(file_paths)
+
     for i, rel in enumerate(paths, 1):
         dest = image_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and not overwrite:
             written.append(rel)
-            continue
-        try:
-            table.file(rel).download(str(dest), overwrite=overwrite, progress=False)
-            written.append(rel)
-        except Exception as exc:  # noqa: BLE001
-            # Only a genuine "file not present in the table" is skippable. Auth,
-            # network, disk, and API errors must surface — silently dropping them
-            # would return a quietly-shrunken (and possibly biased) train sample.
-            if type(exc).__name__ != "NotFoundError":
-                raise RuntimeError(
-                    f"Download of {rel!r} from {image_table!r} failed with "
-                    f"{type(exc).__name__}: {exc}. Aborting rather than returning "
-                    "a partial sample (check token / network / disk)."
-                ) from exc
-            missing.append(rel)
-            if progress:
-                print(f"  [skip-missing] {rel}")
-        if progress and (i % 200 == 0 or i == len(paths)):
+        else:
+            tmp = dest.with_name(dest.name + ".part")
+            try:
+                table.file(rel).download(str(tmp), overwrite=True, progress=False)
+                tmp.replace(dest)  # atomic on the same filesystem
+                written.append(rel)
+            except Exception as exc:  # noqa: BLE001
+                tmp.unlink(missing_ok=True)  # never leave a partial behind
+                if type(exc).__name__ != "NotFoundError":
+                    raise RuntimeError(
+                        f"Download of {rel!r} from {image_table!r} failed with "
+                        f"{type(exc).__name__}: {exc}. Aborting rather than "
+                        "returning a partial sample (check token/network/disk)."
+                    ) from exc
+                missing.append(rel)
+        if progress and (i % 25 == 0 or i == len(paths)):
             print(f"  downloaded {len(written)}/{len(paths)} (missing {len(missing)})")
 
     # Guard against a silently-shrunken sample: a derivation regression would
