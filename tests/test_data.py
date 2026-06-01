@@ -8,8 +8,11 @@ import pytest
 
 from src.data import (
     _chexpert_path_stem,
+    _filter_master,
     _filter_valid_master,
     _parse_chexbert_jsonl,
+    _png_train_file_path,
+    _sample_rows,
     CHEXPERT_COMPETITION_LABELS,
     CHEXPERT_DEMOGRAPHIC_COLUMNS,
     CheXpertValidDataset,
@@ -55,17 +58,99 @@ def test_parse_chexbert_jsonl_raises_on_malformed_json():
         _parse_chexbert_jsonl(["not-json"])
 
 
+def test_parse_chexbert_jsonl_split_param_keeps_train_rows():
+    lines = [
+        json.dumps(_label_record("train/patientA/study1/view1_frontal.jpg", Edema=1.0)),
+        json.dumps(_label_record("valid/patient64620/study1/view1_frontal.jpg", Atelectasis=1.0)),
+    ]
+    df = _parse_chexbert_jsonl(lines, split="train")
+    assert len(df) == 1
+    assert df.iloc[0]["path_to_image"].startswith("train/")
+    assert df.iloc[0]["Edema"] == 1.0
+
+
+def test_parse_chexbert_jsonl_defaults_to_valid_split():
+    # back-compat: default behaviour unchanged (valid-only)
+    lines = [
+        json.dumps(_label_record("train/patientA/study1/view1_frontal.jpg", Edema=1.0)),
+        json.dumps(_label_record("valid/patient64620/study1/view1_frontal.jpg", Atelectasis=1.0)),
+    ]
+    df = _parse_chexbert_jsonl(lines)
+    assert len(df) == 1
+    assert df.iloc[0]["path_to_image"].startswith("valid/")
+
+
+def test_filter_master_selects_requested_split():
+    raw = pd.DataFrame(
+        {
+            "path_to_image": [
+                "train/patientX/study1/view1_frontal.jpg",
+                "valid/patient64620/study1/view1_frontal.jpg",
+            ],
+            "split": ["train", "valid"],
+            "age": [40, 55], "sex": ["M", "F"], "race": ["White", "Asian"],
+            "ethnicity": ["Non-Hispanic", "Hispanic"],
+            "insurance_type": ["Medicare", "Private"],
+            "frontal_lateral": ["Frontal", "Frontal"], "ap_pa": ["AP", "PA"],
+            "report": ["...", "..."],
+        }
+    )
+    out = _filter_master(raw, split="train")
+    assert list(out.columns) == ["path_to_image", "split", *CHEXPERT_DEMOGRAPHIC_COLUMNS]
+    assert len(out) == 1
+    assert out.iloc[0]["path_to_image"].startswith("train/")
+    # _filter_valid_master stays a thin valid wrapper (back-compat)
+    assert len(_filter_valid_master(raw)) == 1
+    assert _filter_valid_master(raw).iloc[0]["path_to_image"].startswith("valid/")
+
+
+def test_sample_rows_is_seeded_and_capped():
+    frame = pd.DataFrame({"path_to_image": [f"train/p{i}/s1/v1_frontal.jpg" for i in range(100)]})
+    a = _sample_rows(frame, n=10, seed=229)
+    b = _sample_rows(frame, n=10, seed=229)
+    assert len(a) == 10
+    assert a["path_to_image"].tolist() == b["path_to_image"].tolist()  # deterministic
+    # n >= len returns all rows (no error, no upsampling)
+    allrows = _sample_rows(frame, n=500, seed=229)
+    assert len(allrows) == 100
+    # different seed -> (very likely) different sample
+    c = _sample_rows(frame, n=10, seed=7)
+    assert a["path_to_image"].tolist() != c["path_to_image"].tolist()
+    # non-positive n is a clear argument error, not a pandas error
+    with pytest.raises(ValueError):
+        _sample_rows(frame, n=0, seed=229)
+    with pytest.raises(ValueError):
+        _sample_rows(frame, n=-5, seed=229)
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
         ("valid/patient64620/study1/view1_frontal.jpg", "patient64620/study1/view1_frontal"),
         ("patient64643/study1/view1_frontal.png", "patient64643/study1/view1_frontal"),
-        ("train/patient42142/study5/view1_frontal.jpg", "train/patient42142/study5/view1_frontal"),
+        # train/ must be stripped too, so master stems (train/...) align with the
+        # on-disk PNG_train stems (patient.../...) — otherwise the train join
+        # produces all-NaN labels (the milestone label-mismatch failure mode).
+        ("train/patient42142/study5/view1_frontal.jpg", "patient42142/study5/view1_frontal"),
         ("valid/patient1/study1/view2_lateral.png", "patient1/study1/view2_lateral"),
     ],
 )
 def test_chexpert_path_stem_normalizes_prefix_and_extension(raw, expected):
     assert _chexpert_path_stem(raw) == expected
+
+
+def test_png_train_file_path_strips_split_and_swaps_extension():
+    # master path_to_image -> the path PNG_train.file() resolves
+    # (verified against Redivis 2026-05-31: strip 'train/', '.jpg' -> '.png')
+    assert (
+        _png_train_file_path("train/patient00003/study1/view1_frontal.jpg")
+        == "patient00003/study1/view1_frontal.png"
+    )
+    # already-png and valid-split inputs handled the same way
+    assert (
+        _png_train_file_path("valid/patient1/study2/view1_frontal.png")
+        == "patient1/study2/view1_frontal.png"
+    )
 
 
 def test_filter_valid_master_selects_valid_split_and_columns():
