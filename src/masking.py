@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--frac", type=float, default=0.15)
     ap.add_argument("--num-labels", type=int, default=3)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--checkpoint", default=None,
+                    help="Optional fine-tuned checkpoint (default: pretrained).")
     ap.add_argument("--output-dir", type=Path, default=Path("results"))
     args = ap.parse_args()
 
@@ -96,7 +98,8 @@ def main():
     set_seed(229)
     cfg = load_config(args.config)
     labels = list(cfg["data"]["label_columns"])
-    model = build_model(cfg["model"]["name"]); model.to(args.device).eval()
+    model = build_model(cfg["model"]["name"], checkpoint=args.checkpoint)
+    model.to(args.device).eval()
     idx = _map_labels_to_indices(labels, list(model.pathologies))
 
     if args.data_root is not None:
