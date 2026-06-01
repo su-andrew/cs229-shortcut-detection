@@ -30,9 +30,6 @@ data/*
 outputs/
 runs/
 wandb/
-checkpoints/
-*.ckpt
-*.pt
 *.pth
 *.onnx
 
