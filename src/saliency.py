@@ -476,12 +476,15 @@ def compute_ig(model, image_tensor, target_label, model_pathologies=None,
 
     NOT VALIDATED -- DO NOT USE FOR REPORTED RESULTS. This was an attempted
     Grad-CAM cross-check, but two issues make its OLL numbers untrustworthy:
-    (1) it takes |attribution|, conflating for/against-class evidence (Grad-CAM
-    is ReLU'd, positive-only); and (2) it attributes through the xrv model's
-    full forward, whose op_threshs output normalization corrupts the gradient
-    path -- IG on this model must target raw logits (a RawLogits wrapper).
-    Diagnosed 2026-06-01: as-is, IG is spuriously anti-correlated with Grad-CAM
-    (r ~ -0.1 to -0.3); a raw-logit + positive-only fix flips it positive but
+    The dominant bug is (1): it takes |attribution|, conflating for/against-class
+    evidence (Grad-CAM is ReLU'd, positive-only). A secondary issue is (2): it
+    attributes through the xrv model's full forward, whose op_threshs output
+    normalization rescales gradient magnitudes non-uniformly across the operating
+    threshold (the map is monotone, so the gradient *sign* is preserved -- this
+    is a magnitude, not a sign, distortion); IG on this model is cleaner if
+    targeted at raw logits via a RawLogits wrapper. Diagnosed 2026-06-01: as-is,
+    IG is spuriously anti-correlated with Grad-CAM (r ~ -0.1 to -0.3), driven
+    mainly by the abs(); a raw-logit + positive-only fix flips it positive but
     still only weakly/inconsistently agrees (real method difference at 7x7 vs
     pixel resolution). The OLL IG cross-check is left to future work. Kept here
     only as a starting point for that fix.
