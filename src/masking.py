@@ -76,6 +76,46 @@ def delta_auroc(y_true, clean_pred, masked_pred) -> float:
     return float(roc_auc_score(y, c) - roc_auc_score(y, m))
 
 
+def delta_auroc_ci(y_true, clean_pred, masked_pred, n_boot: int = 2000,
+                   seed: int = 229, alpha: float = 0.05):
+    """Paired-bootstrap percentile CI for delta_auroc, image as the resample unit.
+
+    Each resample draws image indices with replacement and recomputes the
+    clean-minus-masked AUROC on the SAME indices, preserving the per-image
+    clean/masked pairing. Returns ``(lo, hi)`` -- the percentile bounds only; the
+    point estimate is delta_auroc() itself (a standard percentile CI is reported
+    around that point estimate, not around the bootstrap mean). Returns
+    ``(nan, nan)`` if the statistic is undefined (single-class after filtering)
+    or every resample is degenerate."""
+    from sklearn.metrics import roc_auc_score
+
+    y = np.asarray(y_true)
+    c_all = np.asarray(clean_pred, dtype="float64")
+    m_all = np.asarray(masked_pred, dtype="float64")
+    valid = np.isin(y, (0, 1)) & np.isfinite(c_all) & np.isfinite(m_all)
+    y = y[valid].astype(int)
+    c = c_all[valid]
+    m = m_all[valid]
+    if len(np.unique(y)) < 2:
+        return (float("nan"), float("nan"))
+
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yb = y[idx]
+        if len(np.unique(yb)) < 2:        # degenerate resample: skip, don't redraw
+            continue
+        boots.append(roc_auc_score(yb, c[idx]) - roc_auc_score(yb, m[idx]))
+    if not boots:
+        return (float("nan"), float("nan"))
+    arr = np.asarray(boots, dtype="float64")
+    lo = float(np.percentile(arr, 100 * alpha / 2))
+    hi = float(np.percentile(arr, 100 * (1 - alpha / 2)))
+    return (lo, hi)
+
+
 def main():
     ap = argparse.ArgumentParser(description="R3: masked-region sensitivity (delta-AUROC).")
     ap.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
@@ -121,9 +161,11 @@ def main():
         cp = clean[f"{label}_pred"].to_numpy(); mp = masked[f"{label}_pred"].to_numpy()
         valid = np.isin(yt, (0.0, 1.0))
         n_pos = int((yt[valid] == 1).sum()); n_neg = int((yt[valid] == 0).sum())
+        d_lo, d_hi = delta_auroc_ci(yt, cp, mp)
         rows.append({
             "label": label, "mask_kind": args.kind, "fill": args.fill,
             "delta_auroc": delta_auroc(yt, cp, mp),
+            "delta_auroc_lo": d_lo, "delta_auroc_hi": d_hi,
             "srs": shortcut_reliance_score(cp[valid], mp[valid]),
             "n_pos": n_pos, "n_neg": n_neg,
             "ranked": bool(n_pos >= MIN_N and n_neg >= MIN_N),

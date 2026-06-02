@@ -470,6 +470,47 @@ def compute_gradcam(model, image_tensor, target_label, model_pathologies=None):
     return grayscale_cam
 
 
+def compute_ig(model, image_tensor, target_label, model_pathologies=None,
+               n_steps: int = 32):
+    """Return a (224,224) Integrated Gradients attribution map for a label.
+
+    Cross-check for compute_gradcam: same signature and same (224,224) output
+    contract, so it drops into attribution_outside_mask / the OLL screen
+    unchanged. Uses Captum IntegratedGradients with a zero baseline, takes the
+    per-pixel |attribution| summed over channels, and min-max normalizes to
+    [0,1] to match Grad-CAM's grayscale range. n_steps trades accuracy for
+    compute (IG is ~n_steps forward+backward passes, so this is GPU-favorable).
+    """
+    try:
+        import torch
+        from captum.attr import IntegratedGradients
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Integrated Gradients needs captum installed (pip install captum)."
+        ) from exc
+
+    pathologies = model_pathologies or getattr(model, "pathologies", None)
+    if pathologies is None:
+        raise ValueError("Model does not expose a pathologies list.")
+    xrv_label = model_target_label(target_label, pathologies)
+    target_index = list(pathologies).index(xrv_label)
+
+    # IG needs gradients w.r.t. the input; xrv forward applies op_threshs, but
+    # IG attributes the chosen output index either way (monotone post-process
+    # does not change which pixels matter for that class score's ranking).
+    inp = image_tensor.clone().detach().requires_grad_(True)
+    baseline = torch.zeros_like(inp)  # plain (non-grad) zero baseline, same device
+    ig = IntegratedGradients(model)
+    attributions = ig.attribute(inp, target=target_index,
+                                baselines=baseline, n_steps=n_steps)
+    # (1,1,224,224) -> (224,224): abs, sum channels, normalize to [0,1]
+    attr = attributions.detach().abs().sum(dim=1)[0].cpu().numpy()
+    rng = attr.max() - attr.min()
+    if rng > 0:
+        attr = (attr - attr.min()) / rng
+    return attr.astype("float32")
+
+
 def render_gradcam(
     model,
     image_tensor,
