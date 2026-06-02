@@ -474,6 +474,18 @@ def compute_ig(model, image_tensor, target_label, model_pathologies=None,
                n_steps: int = 32):
     """Return a (224,224) Integrated Gradients attribution map for a label.
 
+    NOT VALIDATED -- DO NOT USE FOR REPORTED RESULTS. This was an attempted
+    Grad-CAM cross-check, but two issues make its OLL numbers untrustworthy:
+    (1) it takes |attribution|, conflating for/against-class evidence (Grad-CAM
+    is ReLU'd, positive-only); and (2) it attributes through the xrv model's
+    full forward, whose op_threshs output normalization corrupts the gradient
+    path -- IG on this model must target raw logits (a RawLogits wrapper).
+    Diagnosed 2026-06-01: as-is, IG is spuriously anti-correlated with Grad-CAM
+    (r ~ -0.1 to -0.3); a raw-logit + positive-only fix flips it positive but
+    still only weakly/inconsistently agrees (real method difference at 7x7 vs
+    pixel resolution). The OLL IG cross-check is left to future work. Kept here
+    only as a starting point for that fix.
+
     Cross-check for compute_gradcam: same signature and same (224,224) output
     contract, so it drops into attribution_outside_mask / the OLL screen
     unchanged. Uses Captum IntegratedGradients with a zero baseline, takes the
