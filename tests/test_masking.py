@@ -2,7 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.masking import make_shortcut_mask, apply_mask, delta_auroc, rank_sort
+from src.masking import (
+    make_shortcut_mask,
+    apply_mask,
+    delta_auroc,
+    delta_auroc_ci,
+    rank_sort,
+)
 
 
 def test_make_shortcut_mask_geometry():
@@ -66,6 +72,30 @@ def test_delta_auroc_ignores_nonfinite_predictions():
     # surviving rows (drop the NaN) are perfectly ranked in both clean and
     # masked -> AUROC 1.0 each -> ΔAUROC exactly 0.0 (finite, not just non-NaN)
     assert d == pytest.approx(0.0)
+
+
+def test_delta_auroc_ci_brackets_point_estimate_and_is_seeded():
+    rng = np.random.default_rng(0)
+    n = 80
+    y = np.array([1] * 40 + [0] * 40)
+    # clean separates well; masked degrades -> positive delta
+    clean = np.concatenate([rng.uniform(0.6, 1.0, 40), rng.uniform(0.0, 0.4, 40)])
+    masked = np.concatenate([rng.uniform(0.4, 0.8, 40), rng.uniform(0.2, 0.6, 40)])
+    point = delta_auroc(y, clean, masked)
+    lo, hi = delta_auroc_ci(y, clean, masked, n_boot=500, seed=229)
+    assert lo <= hi
+    assert lo <= point <= hi          # CI brackets the point estimate
+    # determinism under fixed seed
+    l2, h2 = delta_auroc_ci(y, clean, masked, n_boot=500, seed=229)
+    assert (lo, hi) == (l2, h2)
+
+
+def test_delta_auroc_ci_nan_when_unscoreable():
+    # single-class -> CI undefined -> (nan, nan), no crash
+    y = np.array([1, 1, 1, 1])
+    lo, hi = delta_auroc_ci(y, np.array([.9, .8, .7, .6]),
+                            np.array([.5, .4, .3, .2]), n_boot=100, seed=1)
+    assert np.isnan(lo) and np.isnan(hi)
 
 
 def test_rank_sort_keeps_ranked_above_unranked():

@@ -82,19 +82,28 @@ def is_frontal_path(path: str) -> bool:
 
 
 def compute_oll_rows(predictions, label, image_root, seg_model, model, device="cpu",
-                     frontal_only=True):
+                     frontal_only=True, method="gradcam"):
     """Per-image OLL for one label over scorable rows (y_true in {0,1}).
 
     frontal_only=True drops lateral views, whose lung masks are invalid (see
     is_frontal_path). Set False only to reproduce the confounded all-views run.
+
+    method selects the attribution map: "gradcam" (default) or "ig" (Integrated
+    Gradients). Both return a (224,224) map consumed identically by
+    attribution_outside_mask, so OLL can be cross-checked across methods.
     """
     import torch
 
     from src.data import default_xrv_transform, load_xray_image
     from src.saliency import (
-        compute_gradcam, find_path_column, pred_column, true_column, resolve_image_path,
+        compute_gradcam, compute_ig, find_path_column, pred_column, true_column,
+        resolve_image_path,
     )
     from src.segmentation import lung_mask
+
+    if method not in ("gradcam", "ig"):
+        raise ValueError(f"Unknown attribution method: {method!r} (expected 'gradcam' or 'ig').")
+    attribution_fn = compute_ig if method == "ig" else compute_gradcam
 
     path_col = find_path_column(predictions.columns)
     frame = predictions[[path_col, true_column(label), pred_column(label)]].copy()
@@ -115,7 +124,7 @@ def compute_oll_rows(predictions, label, image_root, seg_model, model, device="c
             n_empty_mask += 1
             continue
         tensor = torch.as_tensor(img, dtype=torch.float32).unsqueeze(0).to(device)
-        cam = compute_gradcam(model, tensor, label)                  # (224,224)
+        cam = attribution_fn(model, tensor, label)                   # (224,224)
         oll = attribution_outside_mask(cam, mask)
         rows.append({"y_true": int(rec.y_true), "y_pred": float(rec.y_pred), "oll": oll})
     return rows, n_empty_mask
@@ -147,6 +156,10 @@ def main():
         "--include-laterals", action="store_true",
         help="Include lateral views (default: frontal-only; lateral lung masks are invalid).",
     )
+    ap.add_argument(
+        "--method", default="gradcam", choices=["gradcam", "ig"],
+        help="Attribution method for OLL: gradcam (default) or ig (Integrated Gradients).",
+    )
     args = ap.parse_args()
 
     from src.models import build_model
@@ -165,7 +178,7 @@ def main():
     for label in labels:
         rows, n_empty_mask = compute_oll_rows(
             preds, label, args.image_root, seg, model, device=args.device,
-            frontal_only=not args.include_laterals,
+            frontal_only=not args.include_laterals, method=args.method,
         )
         if n_empty_mask:
             print(f"[{label}] skipped {n_empty_mask} image(s) with empty lung masks")
@@ -175,7 +188,8 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(summary).sort_values("oll_pos_mean", ascending=False)
-    out = args.output_dir / "oll_by_disease.csv"
+    suffix = "" if args.method == "gradcam" else f"_{args.method}"
+    out = args.output_dir / f"oll_by_disease{suffix}.csv"
     df.to_csv(out, index=False)
     print(df.to_string(index=False))
     print(f"Wrote {out}")
