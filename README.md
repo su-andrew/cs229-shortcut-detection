@@ -2,25 +2,29 @@
 
 CS229 final project (Aarav Arora, Andrew Su, Jonathan You).
 
-Do chest X-ray classifiers detect disease from anatomy, or do they lean on
-non-medical cues — image borders, corner metadata, laterality markers? We take a
-pretrained CheXpert DenseNet-121 and run an **inference-only** audit: where the
-model looks (Grad-CAM relative to the lung field) and how its AUROC moves when
-non-anatomical regions are masked. No training from scratch.
+Chest X-ray classifiers can reach high AUROC while keying on non-medical cues
+like image borders, corner metadata, and laterality markers instead of
+pathology. This repo audits a pretrained CheXpert DenseNet-121 for that
+behavior. The audit is inference-only and looks at two things: where the model
+attends (Grad-CAM relative to the lung field), and how its AUROC changes when
+non-anatomical regions are masked. We also include a masked-augmentation
+fine-tuning experiment and two linear probes on the frozen features; the audit
+itself does no training.
 
-The pipeline is a four-rung ladder (R0→R3); each rung produces a self-contained
-report artifact, so the analysis degrades gracefully if a rung is cut.
+The code is split into four stages, R0 through R3. Each stage writes its own
+output file, so a partial run still produces usable results.
 
-| Rung | Module | Produces |
+| Stage | Module | Produces |
 |---|---|---|
-| **R0** | `src/saliency.py` | Real Grad-CAM error-case figures for the weakest labels |
-| **R1** | `src/segmentation.py` | Lung-mask helpers (xrv PSPNet → 224×224 boolean masks, co-registered to the classifier grid) that R2 calls per image |
-| **R2** | `src/ola.py` | Per-disease **out-of-lung localization (OLL)** screen — fraction of Grad-CAM attribution outside the lungs, with image-row bootstrap CIs |
-| **R3** | `src/masking.py` | Per-disease **masked-region sensitivity** — ΔAUROC when heuristic non-anatomical regions are masked |
+| R0 | `src/saliency.py` | Grad-CAM error-case figures for the weakest labels |
+| R1 | `src/segmentation.py` | Lung-mask helpers (xrv PSPNet to 224×224 boolean masks, co-registered to the classifier grid) that R2 calls per image |
+| R2 | `src/ola.py` | Per-disease out-of-lung localization (OLL) screen: fraction of Grad-CAM attribution outside the lungs, with image-row bootstrap CIs |
+| R3 | `src/masking.py` | Per-disease masked-region sensitivity: ΔAUROC when heuristic non-anatomical regions are masked |
 
-> **Naming:** R2 measures *where the model looks* (localization, no perturbation);
-> R3 measures *sensitivity to a chosen perturbation*. Neither proves a region is a
-> learned shortcut, so the code and report avoid "shortcut reliance" / "causal."
+A note on naming: R2 measures where the model looks (localization, no
+perturbation), and R3 measures sensitivity to a perturbation we apply. Neither
+shows that a region is a learned shortcut, so the code and report avoid the
+terms "shortcut reliance" and "causal."
 
 ## Project Structure
 
@@ -37,10 +41,14 @@ report artifact, so the analysis degrades gracefully if a rung is cut.
 │   ├── segmentation.py    # lung-mask helpers via xrv PSPNet, called by R2 (R1)
 │   ├── ola.py             # out-of-lung localization screen (R2)
 │   ├── masking.py         # masked-region sensitivity / ΔAUROC (R3)
+│   ├── linear_probe.py    # logistic-regression probe on frozen penultimate features
+│   ├── confound_probe.py  # AP-vs-PA acquisition-protocol probe (named-confound test)
+│   ├── finetune.py        # masked-augmentation fine-tune (mitigation extension)
+│   ├── mitigation_eval.py # re-run OLL/AUROC screens on fine-tuned checkpoints
 │   ├── interpretability.py# attribution_outside_mask primitive
 │   ├── shortcuts.py       # shortcut_reliance_score primitive
 │   ├── utils.py           # set_seed, helpers
-│   └── train.py           # unused placeholder — the project is inference-only
+│   └── train.py           # unused placeholder (the audit trains nothing)
 └── tests/
 ```
 
@@ -59,19 +67,19 @@ conda env update -f environment.yml --prune
 
 ## Data
 
-The pipeline runs on the **CheXpert Plus validation split** (234 images) pulled
-from Stanford AIMI's Redivis. CheXpert Plus ships CheXbert *machine-extracted*
-labels (not the radiologist-adjudicated `valid.csv`); we use the
-`impression_fixed` label derivation — `report_fixed` scores near chance.
+The pipeline runs on the CheXpert Plus validation split (234 images) from
+Stanford AIMI's Redivis. CheXpert Plus ships CheXbert machine-extracted labels
+rather than the radiologist-adjudicated `valid.csv`. We use the
+`impression_fixed` derivation; `report_fixed` scores near chance.
 
 ```bash
 export REDIVIS_API_TOKEN=...        # AIMI/Redivis access required
 python -m src.data fetch --dataset-ref AIMI.chexpert_plus
 ```
 
-This writes images + `metadata.csv` under `data/chexpert/`. The `data/` images
-are gitignored; `results/` is untracked — regenerate it in order
-(baseline → ola → masking).
+This writes images and `metadata.csv` under `data/chexpert/`. The `data/` images
+are gitignored, and `results/` is untracked, so regenerate it in order
+(baseline, ola, masking).
 
 ## Usage
 
@@ -90,7 +98,9 @@ python -m src.masking --kind border --fill mean --num-labels 3 --device cpu
 #   --kind {corners,border,laterality}   --fill {mean,zero}
 ```
 
-All steps are inference-only and run in minutes on CPU/MPS — no GPU required.
+The audit steps above are inference-only and run in a few minutes on CPU or MPS;
+no GPU is needed. The mitigation fine-tune and its cross-device checks need a GPU
+(see `notebooks/`).
 
 Run tests:
 
@@ -104,19 +114,23 @@ Per-disease AUROC (impression_fixed labels): Cardiomegaly 0.851, Consolidation
 0.858, Edema 0.860, Pleural Effusion 0.877. Atelectasis is undefined on this
 slice (no negatives under `impression_fixed`).
 
-The two methods rank diseases differently, which is itself the finding:
+The two screens rank the diseases differently:
 
-- **R2 out-of-lung attention** (OLL, y=1): Consolidation 0.649, Edema 0.617, Cardiomegaly 0.498.
-- **R3 border reliance** (ΔAUROC, border mask): Consolidation 0.064, Cardiomegaly 0.050, Edema ≈ 0.007, Pleural Effusion ≈ 0.001.
+- R2 out-of-lung attention (OLL, y=1): Consolidation 0.649, Edema 0.617, Cardiomegaly 0.498.
+- R3 border sensitivity (ΔAUROC, border mask): Consolidation 0.064, Cardiomegaly 0.050, Edema 0.007, Pleural Effusion 0.001.
 
-**Consolidation** is the only disease high on both — its attention sits largely
-outside the lungs *and* masking the border measurably drops its AUROC. The other
-two diverge: Cardiomegaly shows border sensitivity without high out-of-lung
-attention, while Edema shows the reverse. So the methods are complementary, not
-redundant — each surfaces a failure mode the other misses.
+Using paired bootstrap CIs, only Cardiomegaly's border effect is distinguishable
+from zero (ΔAUROC 0.050, 95% CI [0.002, 0.112]). Consolidation has the largest
+point estimate, but its CI includes zero, so we treat it as suggestive only. The
+two screens otherwise point in different directions: Cardiomegaly has the one
+significant masking effect but the lowest out-of-lung attention, while
+Consolidation and Edema have the highest out-of-lung attention but come back null
+to suggestive under masking. We read this as a reason to run more than one screen
+rather than trust a single ranking.
 
 ## Future Work
 
-Gold-label (radiologist `valid.csv`) validation, the Atelectasis combined-source
-label fix, Integrated Gradients cross-validation of R2, a logistic-regression
-probe on frozen DenseNet features, and MIMIC-CXR cross-hospital evaluation.
+The linear probe, the AP-vs-PA confound probe, the mitigation fine-tune, and the
+Integrated Gradients cross-check are in the repo (`src/`, `notebooks/`). Still
+open: gold-label (radiologist `valid.csv`) validation, the Atelectasis
+combined-source label fix, and MIMIC-CXR cross-hospital evaluation.
